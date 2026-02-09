@@ -57,7 +57,7 @@ The `.obs` dataframe **must** contain the following columns:
 
 ### 3. System Requirements
 * **Slurm Workload Manager:** Scripts are configured to submit jobs via `sbatch`.
-* **Conda Environment:** A valid path to a Conda environment containing `anndata` and `scanpy`.
+* **Conda Environment:** A Conda environment (R-deseq2) containing R, python, reticulate, anndata, and other necessary libraries.
 
 ---
 

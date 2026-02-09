@@ -1,0 +1,148 @@
+---
+title: "Differentiation GEP Module Scoring in Foxp3-DTR"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup}
+library(tidyverse)
+library(patchwork)
+library(purrr)
+library(ggpubr)
+library(rstatix)
+library(RColorBrewer)
+library(ggrepel)
+
+# lm packages
+library(dplyr)
+library(sandwich)
+library(emmeans)
+library(broom)
+library(lme4)
+library(lmerTest)
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+source("../functions/r_custom/plotting_fxns.R")
+theme_set(theme_Publication())
+interaction_palette <- c("#808080",brewer.pal(5,"Dark2"))
+names(interaction_palette) <- c("none", "additive over saturation", "buffering", 
+                      "buffering complete", "synergy negative", "synergy positive")
+```
+
+# Goal
+
+Test for increases or decreases in GEPs in different CD4 T cell clusters from Foxp3-DTR mice. These GEPs are the sPCA components derived from bulk RNA-seq of CD4 T cells treated with different single and combinatorial stimuli at a differentiation time points (SIG18) 
+
+# Import
+
+```{r}
+# import module scores
+iln_obs <- read_csv('/data1/rudenska/EYW/git_projects/SIG19/analysis_outs/projection/DTR_CD4T_iLN_scored_obs.csv')
+# import associations between components and ligands from SIG18
+lmScored <- read_csv("/data1/rudenska/EYW/git_projects/SIG18/analysis_outs/spca/lm_fit_zscore_degs_alpha10.0_sPCA.csv")
+```
+
+# Linear Modeling
+
+Here, we will examine only the isotype treated mice (since agonist antibody treated mice may have biased siganling activities) and use linear models to quantify differences in differentiation sPCA components between clusters.
+
+```{r}
+# average scores across cells within each cluster and mouse
+iln_obs_celltype <- iln_obs %>%
+  mutate(cluster_name = leiden_1.0) %>%
+  dplyr::select(treatment, cluster_name, sex, cage, mouse, contains("_score_")) %>%
+  group_by(across(-contains("_score_"))) %>%
+  summarise(across(contains("_score_"), \(x) mean(x, na.rm = TRUE)), .groups = "drop")
+```
+
+```{r}
+# define comps
+comps <- iln_obs_celltype %>% select(starts_with("SIG18_score_scaled_")) %>% names()
+
+# filter for only isotype treated mice.
+data <- iln_obs_celltype %>%
+  filter(treatment == "isotype") %>%
+  mutate(cluster_name = paste0("leiden_",cluster_name),
+         cage = factor(cage),
+         sex = factor(sex))
+
+res_celltype <- bind_rows(lapply(comps, function(y) {
+  fit <- lm(as.formula(paste(y, "~ cluster_name")), data = data)
+  em  <- emmeans(fit, ~ cluster_name)
+  cts <- contrast(em, method = "del.eff")
+  out <- broom::tidy(cts) %>%
+    mutate(component = y)
+}))
+```
+
+# Treatment Volcano Plots
+
+Volcano plots of emm together with interaction coefficient and pvalue from SIG18 spca annotation
+
+```{r, fig.height=8, fig.width=12}
+# filter lmscored for TGFb interaction terms
+lmTgfb <- lmScored %>%
+  filter(term %in% c("ligand1TGFb:ligand2TNF"))
+
+p1 <- res_celltype %>%
+  mutate(
+    significant = ifelse(adj.p.value < 0.1, "yes", "no"),
+    component = gsub("SIG18_score_scaled_", "", component)
+  ) %>%
+  left_join(lmTgfb, by = "component", suffix = c("", "_interaction")) %>%
+  filter(contrast %in% c("leiden_5 effect","leiden_7 effect","leiden_9 effect")) %>%
+  ggplot(aes(x = estimate, y = -log10(adj.p.value))) +
+    geom_point(aes(fill = estimate_interaction, size = -log10(p_adj)), shape=21) +
+    theme(aspect.ratio = 1) +
+    scale_fill_distiller(palette = "RdBu", limits=c(-2.2,2.2)) +
+    scale_size_continuous(limits = c(0,15), breaks = c(seq(0,15,5))) +
+    facet_wrap( ~ contrast) +
+    labs(x = "treatment estimate",
+         fill = "estimate\nTGFb:TNF",
+         size = "pscore\nTGFb:TNF")
+p2 <- res_celltype %>%
+  mutate(
+    significant = ifelse(adj.p.value < 0.1, "yes", "no"),
+    component = gsub("SIG18_score_scaled_", "", component)
+  ) %>%
+  left_join(lmTgfb, by = "component", suffix = c("", "_interaction")) %>%
+  filter(contrast %in% c("leiden_5 effect","leiden_7 effect","leiden_9 effect")) %>%
+  ggplot(aes(x = estimate, y = -log10(adj.p.value))) +
+    geom_point(aes(fill = estimate_interaction, size = -log10(p_adj)), shape=21) +
+    geom_text_repel(aes(label = ifelse(significant == "yes", component, ""))) +
+    theme(aspect.ratio = 1) +
+    scale_fill_distiller(palette = "RdBu", limits=c(-2.2,2.2)) +
+    scale_size_continuous(limits = c(0,15), breaks = c(seq(0,15,5))) +
+    facet_wrap( ~ contrast) +
+    labs(x = "treatment estimate",
+         fill = "estimate\nTGFb:TNF",
+         size = "pscore\nTGFb:TNF")
+p1/p2
+ggsave("../analysis_outs/plots/DTR_iLN_SIG18_scored_TGFb_celltype_leiden5_vs_rest.pdf")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

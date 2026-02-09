@@ -1,0 +1,277 @@
+---
+title: "SIG13 Reegression Model Calibration Testing"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup}
+library(tidyverse)
+library(patchwork)
+library(purrr)
+library(ggpubr)
+library(rstatix)
+library(ggrepel)
+library(RColorBrewer)
+
+library(broom)
+library(yardstick)
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+source("../../../functions/r_custom/plotting_fxns.R")
+theme_set(theme_Publication())
+tab10_colors <- tableau_color_pal(palette = "Tableau 10")(10)
+```
+
+# Goal
+
+Calculate activity differences using linear models based on activity scores from "2_model_calibration.ipynb" and then perform ROC analysis to determine sensitivity and specificity of models with different parameters.
+
+# SIG14 Calibration Results
+
+```{r}
+activity_combined <- read_csv('../../../analysis_outs/cytosig/model_optimization/activity_combined_SIG14.csv')
+r2_combined <- read_csv("../../../analysis_outs/cytosig/model_optimization/r2_combined_SIG14.csv")
+```
+
+```{r}
+# define ligands in experiments and associated signaling activities in model
+mapping_tibble <- tibble(
+  stim = c(
+    'IFNg_TNF', 'IFNg_none', 'IL21_CCL19', 'IL21_CCL21A', 'IL21_IL1B', 
+    'IL21_TNF', 'IL21_none', 'IL27_TNF', 'IL27_none', 'IL2_TNF', 
+    'IL2_none', 'IL4_TNF', 'IL4_none', 'IL6_CCL19', 'IL6_IL1B', 
+    'IL6_TNF', 'IL6_none', 'TGFb_TNF', 'TGFb_none', 'none_CCL19', 'none_CCL21A', 'none_TNF'
+  ),
+  activity = c(
+    'IL27_TNFSF18_c', 'IL27', 'IL21_CCL19_c', 'IL21_CCL19_c', 'IL21_IL1B_c', 
+    'IL6_TNFSF18_c', 'IL21', 'IL27_TNFSF18_c', 'IL27', 'IL2_TNFSF18_c', 
+    'IL2', 'IL4_TNFSF18_c', 'IL4', 'IL6_CCL19_c', 'IL21_IL1B_c', 
+    'IL6_TNFSF18_c', 'IL21', 'TGFB1_TNFSF18_c','TGFB1', 'CCL19', 'CCL21A', 'TNFSF18'
+  )
+)
+```
+
+```{r}
+# for each activity and model, perform linear modeling to quantify activity differences
+activity_out <- tibble()
+for(m in unique(activity_combined$model)) {
+  df <- activity_combined %>%
+    filter(model == m) %>%
+    separate_wider_delim(sample, "_", names = c("ligand1", "ligand2", "mouse", "well")) %>%
+    mutate(condition = factor(paste0(ligand1, "_", ligand2))) %>%
+    mutate(condition = relevel(condition, ref = "none_none"))
+  for(y_var in unique(mapping_tibble$activity)) {
+    # define pos and negative conditions
+    pos_ligands <- mapping_tibble %>%
+      filter(activity == y_var) %>%
+      pull(stim)
+    neg_ligands <- mapping_tibble %>%
+      filter(activity != y_var) %>%
+      pull(stim)
+    # run lm
+    out <- lm(as.formula(paste0(y_var, '~ condition')), df) %>%
+      broom::tidy() %>%
+      filter(grepl("condition", term)) %>%
+      mutate(term = gsub("condition", "", term)) %>%
+      mutate(
+        category = case_when(
+          term %in% pos_ligands ~ "true_activity",
+          term %in% neg_ligands ~ "other_activity"
+        ),
+        model = m,
+        target_activity = y_var
+      ) %>%
+      mutate(padj = p.adjust(p.value))
+    
+    activity_out <- bind_rows(activity_out, out)
+  }
+}
+activity_out <- activity_out %>%
+  mutate(interaction_cat = ifelse(grepl("none",term),"single","combinatorial"),
+         model_type = ifelse(grepl("ridge",model),"ridge","elastic"),
+         pscore = -log10(padj))
+```
+
+```{r}
+# Calculate and visualize ROC curves by model
+activity_out %>%
+  filter(model_type == "ridge") %>%
+  filter(!is.na(category)) %>%
+  mutate(category = factor(category, levels = c("true_activity", "other_activity"))) %>%
+  group_by(model, model_type) %>%
+  roc_curve(category, estimate) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color = model)) +
+  geom_path(linewidth = 1) +
+  geom_abline(lty = 3, color = "grey50") +
+  scale_color_manual(values = tab10_colors) +
+  coord_equal() +
+  ggtitle("Ridge Regression ROC")
+
+# Calculate AUC values for each model
+activity_out %>%
+  filter(model_type == "ridge") %>%
+  filter(!is.na(category)) %>%
+  mutate(category = factor(category, levels = c("true_activity", "other_activity"))) %>%
+  group_by(model) %>%
+  roc_auc(category, estimate)
+```
+
+```{r, fig.height=4, fig.width=10}
+p1 <- activity_out %>%
+  filter(model == "ridge_zscore_50_weighted") %>%
+  filter(!is.na(category)) %>%
+  ggplot(aes(x = category, y = estimate)) +
+  geom_boxplot(aes(fill = interaction_cat)) +
+  theme(aspect.ratio=1)
+
+p2 <- activity_out %>%
+  filter(model == "ridge_zscore_50_weighted") %>%
+  filter(!is.na(category)) %>%
+  ggplot(aes(x = category, y = estimate)) +
+  geom_boxplot() +
+  theme(aspect.ratio=1)
+p1+p2
+```
+
+# SIG21 Calibration Results
+
+```{r}
+activity_combined <- read_csv('../../../analysis_outs/cytosig/model_optimization/activity_combined_SIG21.csv')
+r2_combined <- read_csv("../../../analysis_outs/cytosig/model_optimization/r2_combined_SIG21.csv")
+```
+
+```{r}
+# define ligands in experiments and associated signaling activities in model
+mapping_tibble <- tibble(
+  stim = c(
+    'IFNG_TNF', 'IFNG_none', 
+    'IL21_TNF', 'IL21_none', 'IL27_TNF', 'IL27_none', 'IL2_TNF', 
+    'IL2_none', 'IL4_TNF', 'IL4_none',
+    'IL6_TNF', 'IL6_none', 'TGFb_TNF', 'TGFb_none', 'none_TNF',
+    'IL4_IL21','IL27_IL21'
+  ),
+  activity = c(
+    'IL27_TNFSF18_c', 'IL27_c', 
+    'IL6_TNFSF18_c', 'IL21_c', 'IL27_TNFSF18_c', 'IL27_c', 'IL2_TNFSF18_c', 
+    'IL2', 'IL4_TNFSF18_c', 'IL4',
+    'IL6_TNFSF18_c', 'IL21_c', 'TGFB1_TNFSF18_c','TGFB1', 'TNFSF18_c',
+    'IL4_IL21_c','IL27_IL21_c'
+  )
+)
+```
+
+```{r}
+# for each activity and model, perform linear modeling to quantify activity differences
+activity_out <- tibble()
+for(m in unique(activity_combined$model)) {
+  df <- activity_combined %>%
+    filter(model == m) %>%
+    separate_wider_delim(sample, "_", names = c("ligand1", "ligand2", "replicate")) %>%
+    mutate(condition = factor(paste0(ligand1, "_", ligand2))) %>%
+    mutate(condition = relevel(condition, ref = "none_none"))
+  for(y_var in unique(mapping_tibble$activity)) {
+    # define pos and negative conditions
+    pos_ligands <- mapping_tibble %>%
+      filter(activity == y_var) %>%
+      pull(stim)
+    neg_ligands <- mapping_tibble %>%
+      filter(activity != y_var) %>%
+      pull(stim)
+    # run lm
+    out <- lm(as.formula(paste0(y_var, '~ condition')), df) %>%
+      broom::tidy() %>%
+      filter(grepl("condition", term)) %>%
+      mutate(term = gsub("condition", "", term)) %>%
+      mutate(
+        category = case_when(
+          term %in% pos_ligands ~ "true_activity",
+          term %in% neg_ligands ~ "other_activity"
+        ),
+        model = m,
+        target_activity = y_var
+      ) %>%
+      mutate(padj = p.adjust(p.value))
+    
+    activity_out <- bind_rows(activity_out, out)
+  }
+}
+activity_out <- activity_out %>%
+  mutate(interaction_cat = ifelse(grepl("none",term),"single","combinatorial"),
+         model_type = ifelse(grepl("ridge",model),"ridge","elastic"),
+         pscore = -log10(padj))
+```
+
+```{r}
+# Calculate and visualize ROC curves by model
+activity_out %>%
+  filter(model_type == "ridge") %>%
+  filter(!is.na(category)) %>%
+  mutate(category = factor(category, levels = c("true_activity", "other_activity"))) %>%
+  group_by(model, model_type) %>%
+  roc_curve(category, estimate) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color = model)) +
+  geom_path(linewidth = 1) +
+  geom_abline(lty = 3, color = "grey50") +
+  scale_color_manual(values = tab10_colors) +
+  coord_equal() +
+  ggtitle("Ridge Regression ROC")
+
+# Calculate AUC values for each model
+activity_out %>%
+  filter(model_type == "ridge") %>%
+  filter(!is.na(category)) %>%
+  mutate(category = factor(category, levels = c("true_activity", "other_activity"))) %>%
+  group_by(model) %>%
+  roc_auc(category, estimate)
+```
+
+```{r, fig.height=4, fig.width=10}
+p1 <- activity_out %>%
+  filter(model == "ridge_zscore_50_weighted") %>%
+  filter(!is.na(category)) %>%
+  ggplot(aes(x = category, y = estimate)) +
+  geom_boxplot(aes(fill = interaction_cat)) +
+  theme(aspect.ratio=1)
+
+p2 <- activity_out %>%
+  filter(model == "ridge_zscore_50_weighted") %>%
+  filter(!is.na(category)) %>%
+  ggplot(aes(x = category, y = estimate)) +
+  geom_boxplot() +
+  theme(aspect.ratio=1)
+p1+p2
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -3,6 +3,7 @@
 /processing_outs
 /imports_stable/*
 !/imports_stable/README.md
+/.claude
 
 # VS Code
 /.vscode

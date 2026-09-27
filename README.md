@@ -1,5 +1,5 @@
 # signal_seq_2026
-This repository contains the analysis code, custom functions, and reproducibility environments for the 2026 Signal-seq manuscript. The `imports_stable` data directory is distributed separately as per-experiment Zenodo archives (see `imports_stable/README.md` for the list): **will be made available upon publication**  
+This repository contains the analysis code, custom functions, and reproducibility environments for the 2026 Signal-seq manuscript. The `imports_stable` data directory is distributed separately as a single Zenodo deposit (see `imports_stable/README.md` for the archive list): **will be made available upon publication**  
 
 ## Repository Structure
 
@@ -75,7 +75,7 @@ Scripts use no absolute paths. Each one finds the repository root by searching u
 
 The code in this repository runs against the `imports_stable/` data folder, which is downloaded separately.
 
-1. **Get the data.** `imports_stable/` (~207 GB total) is distributed on Zenodo as one `.tar.gz` archive per experiment (SIG13 split into four archives by subfolder, to keep archives smaller). Download the archive(s) covering the modules you plan to run and extract each at the root of the cloned repository (e.g. `tar -xzf SIG13_cellranger.tar.gz -C /path/to/signal_seq_2026`) — every archive stores paths as `imports_stable/<...>`, so extracting it there recreates the layout `signal_seq_2026/imports_stable/SIG13/`, `signal_seq_2026/imports_stable/SIG18/`, and so on. A symbolic link named `imports_stable` pointing to a copy stored elsewhere also works. See `imports_stable/README.md` for the full list of archives and their Zenodo records, and the layout [below](#imports_stable-layout).
+1. **Get the data.** `imports_stable/` (~207 GB total) is distributed as a single Zenodo deposit containing one `.tar.gz` archive per experiment (SIG13 split into four archives by subfolder, to keep archives smaller). Download the archive(s) covering the modules you plan to run and extract each at the root of the cloned repository (e.g. `tar -xzf SIG13_cellranger.tar.gz -C /path/to/signal_seq_2026`) — every archive stores paths as `imports_stable/<...>`, so extracting it there recreates the layout `signal_seq_2026/imports_stable/SIG13/`, `signal_seq_2026/imports_stable/SIG18/`, and so on. A symbolic link named `imports_stable` pointing to a copy stored elsewhere also works. See `imports_stable/README.md` for the full list of archives and the deposit's DOI, and the layout [below](#imports_stable-layout).
 2. **Add the data that is not included, if needed.**
     * The public datasets used for disease scoring and AMP validation in `03_activity_inference_model` (AMP 2023, Inflammation Atlas, Thomas IBD) were not generated in this study. Obtain the processed CD4 T cell objects and place them at the paths the scripts expect:
         * `imports_stable/external/AMP_2023/amp_2023_cd4_processed.h5ad` and `imports_stable/external/AMP_2023/2023_AMP2_CTAP.csv` (AMP 2023 rheumatoid arthritis synovium)

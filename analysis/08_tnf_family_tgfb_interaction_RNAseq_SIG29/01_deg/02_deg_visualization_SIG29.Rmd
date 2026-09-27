@@ -1,0 +1,171 @@
+---
+title: "DEG Visualization SIG29: TNF-family interaction FC-FC"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+---
+
+Visualizes whether the TGFb:TNF interaction (synergy/buffering) effect from
+`01_deg_analysis_SIG29.Rmd` (stable copy read from
+`imports_stable/SIG29/analysis_outs/res_interaction_scored_SIG29.csv`)
+is **conserved across other TNF-family members** (`TL1A`, `OX40L`, `DTA1`)
+stimulated alongside TGFb in the same experiment, via per-gene FC-FC plots:
+x = the gene's `TGFb:TNF` interaction LFC, y = the same gene's `TGFb:<member>`
+interaction LFC.
+
+```{r setup}
+library(tidyverse)
+library(ggplot2)
+library(patchwork)
+library(ggrepel)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# Repo-relative paths: inputs from imports_stable/, outputs to analysis_outs/<module>/
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "08_tnf_family_tgfb_interaction_RNAseq_SIG29")
+dir.create(outs_dir, recursive = TRUE, showWarnings = FALSE)
+source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
+theme_set(theme_Publication())
+```
+
+### [Import Data]{.underline}
+
+```{r}
+interaction_scored <- read_csv(file.path(imports_dir, "SIG29/analysis_outs/res_interaction_scored_SIG29.csv"))
+
+# TNF is the reference TNF-family member; TL1A/OX40L/DTA1 are compared against it
+REF_MEMBER <- "TNF"
+OTHER_MEMBERS <- setdiff(unique(interaction_scored$ligand2), REF_MEMBER)
+OTHER_MEMBERS
+```
+
+### [Build FC-FC table]{.underline}
+
+One row per gene per non-reference member, with both the reference (`TNF`)
+and comparison member's interaction LFC/significance/class joined side by
+side.
+
+```{r}
+ref_int <- interaction_scored %>%
+  filter(ligand2 == REF_MEMBER) %>%
+  dplyr::select(ensembl_ID, gene,
+                lfc_interaction_ref = lfc_interaction,
+                padj_interaction_ref = padj_interaction,
+                interaction_class_ref = interaction_class)
+
+fc_fc <- interaction_scored %>%
+  filter(ligand2 %in% OTHER_MEMBERS) %>%
+  dplyr::select(ensembl_ID, gene, member = ligand2,
+                lfc_interaction_member = lfc_interaction,
+                padj_interaction_member = padj_interaction,
+                interaction_class_member = interaction_class) %>%
+  inner_join(ref_int, by = c("ensembl_ID", "gene")) %>%
+  mutate(
+    sig_ref    = !is.na(padj_interaction_ref)    & padj_interaction_ref    < 0.1,
+    sig_member = !is.na(padj_interaction_member) & padj_interaction_member < 0.1,
+    concordance = case_when(
+      sig_ref & sig_member &
+        sign(lfc_interaction_ref) == sign(lfc_interaction_member) ~ "concordant (both sig)",
+      sig_ref & sig_member                                        ~ "discordant (both sig)",
+      sig_ref | sig_member                                        ~ "sig in one",
+      TRUE                                                        ~ "n.s. in both"
+    )
+  )
+
+write_csv(fc_fc, file.path(outs_dir, "res_interaction_fcfc_SIG29.csv"))
+```
+
+### [FC-FC plots: TGFb:member interaction vs TGFb:TNF interaction]{.underline}
+
+Per-facet Pearson correlation (computed over all genes, not just significant
+ones) summarizes how conserved the interaction program is between TNF and
+each family member; genes significant in both are labelled.
+
+```{r}
+rho <- fc_fc %>%
+  group_by(member) %>%
+  summarise(r = cor(lfc_interaction_ref, lfc_interaction_member, use = "complete.obs"),
+            n_concordant = sum(concordance == "concordant (both sig)"),
+            n_discordant = sum(concordance == "discordant (both sig)"),
+            .groups = "drop")
+rho
+```
+
+```{r, fig.width=12, fig.height=4}
+fc_fc %>%
+  left_join(rho, by = "member") %>%
+  mutate(facet_label = paste0("TGFb:", member, " vs TGFb:", REF_MEMBER,
+                              " (r = ", round(r, 2), ")")) %>%
+  ggplot(aes(x = lfc_interaction_ref, y = lfc_interaction_member)) +
+  geom_hline(yintercept = 0, lty = 2, color = "grey70") +
+  geom_vline(xintercept = 0, lty = 2, color = "grey70") +
+  geom_abline(slope = 1, intercept = 0, lty = 3, color = "grey50") +
+  geom_point(size = 0.8, alpha = 0.7) +
+  facet_wrap(~ facet_label, nrow = 1) +
+  theme(aspect.ratio = 1) +
+  labs(x = paste0("TGFb:", REF_MEMBER, " interaction LFC"),
+       y = "TGFb:member interaction LFC")
+
+ggsave(file.path(outs_dir, "res_interaction_fcfc_simple_SIG29.pdf"))
+```
+
+```{r, fig.width=12, fig.height=4}
+concordance_palette <- c(
+  "concordant (both sig)"  = "#D55E00",
+  "discordant (both sig)"  = "#0072B2",
+  "sig in one"             = "#009E73",
+  "n.s. in both"           = "grey80"
+)
+
+fc_fc %>%
+  left_join(rho, by = "member") %>%
+  mutate(facet_label = paste0("TGFb:", member, " vs TGFb:", REF_MEMBER,
+                              " (r = ", round(r, 2), ")")) %>%
+  ggplot(aes(x = lfc_interaction_ref, y = lfc_interaction_member)) +
+  geom_hline(yintercept = 0, lty = 2, color = "grey70") +
+  geom_vline(xintercept = 0, lty = 2, color = "grey70") +
+  geom_abline(slope = 1, intercept = 0, lty = 3, color = "grey50") +
+  geom_point(aes(color = concordance), size = 0.8, alpha = 0.7) +
+  geom_text_repel(aes(label = ifelse(concordance == "concordant (both sig)" |
+                                     concordance == "discordant (both sig)", gene, "")),
+                  size = 2, max.overlaps = 15) +
+  scale_color_manual(values = concordance_palette) +
+  facet_wrap(~ facet_label, nrow = 1) +
+  theme(aspect.ratio = 1) +
+  labs(x = paste0("TGFb:", REF_MEMBER, " interaction LFC"),
+       y = "TGFb:member interaction LFC",
+       color = "concordance\n(padj < 0.1)")
+
+ggsave(file.path(outs_dir, "res_interaction_fcfc_SIG29.pdf"))
+```
+
+
+
+### [Concordance summary]{.underline}
+
+Fraction of genes significant in the reference (`TNF`) interaction that are
+concordant (same sign, also significant) vs. discordant vs. not significant
+in each other member.
+
+```{r, fig.width=8, fig.height=5}
+fc_fc %>%
+  filter(sig_ref) %>%
+  count(member, concordance) %>%
+  group_by(member) %>%
+  mutate(frac = n / sum(n)) %>%
+  ggplot(aes(x = member, y = frac, fill = concordance)) +
+  geom_col() +
+  scale_fill_manual(values = concordance_palette) +
+  labs(x = "TNF-family member", y = "fraction of TGFb:TNF-significant genes",
+       title = "Conservation of TGFb:TNF-significant interaction genes in other members")
+```

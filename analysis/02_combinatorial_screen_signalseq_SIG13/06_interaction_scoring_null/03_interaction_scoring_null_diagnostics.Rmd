@@ -1,0 +1,305 @@
+---
+title: "Interaction Scoring Null Calibration & Real vs. Null Comparison"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup}
+library(tidyverse)
+library(data.table)
+library(scales)
+library(patchwork)
+knitr::opts_chunk$set(echo = TRUE)
+
+# Repo-relative paths (inputs: imports_stable/, outputs: analysis_outs/)
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "02_combinatorial_screen_signalseq_SIG13")
+dir.create(file.path(outs_dir, "plots/interaction_scoring_null"), recursive = TRUE, showWarnings = FALSE)
+source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
+theme_set(theme_Publication())
+
+filter_cutoff_single <- 0.1
+filter_cutoff_interaction <- 0.1
+
+null_dir <- file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/glmGamPoi_null")
+real_interaction_dir <- file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/glmGamPoi_interaction")
+```
+
+# Goal
+
+To assess calibration of our Gamma-Poisson GLM that modles single nad interaction effects, we calculate an empirical null-benchmark. As our screen includes 9 distinct barcoded non-targeting linker VLPs, we will treat these linker VLPs as stand ins for ligand1/ligand2 identities and run them through an *identical* GLM pipeline (same design formula, same covariates, same `filter_cutoff`, same contrasts). Substituting these linker VLPs for real ligands and testing them against each other gives a sample of test statistics drawn from a true null. This report assess the empiric null p-value distribution and compares it to the real data.
+
+# Import
+
+```{r}
+nullInteraction <- fread(
+  file.path(null_dir, paste0("glmGamPoi_interaction_null_lfc_", filter_cutoff_interaction, "filter.csv")),
+  select = c("pval", "adj_pval", "lfc", "interaction")
+) %>%
+  as_tibble() %>%
+  mutate(contrast = "ligand1:ligand2")
+
+nullSingles <- fread(
+  file.path(null_dir, paste0("glmGamPoi_interaction_null_singles_lfc_", filter_cutoff_interaction, "filter.csv")),
+  select = c("pval", "adj_pval", "lfc")
+) %>%
+  as_tibble() %>%
+  mutate(contrast = "ligand")
+
+comboCoverage <- read_csv(file.path(null_dir, paste0("interaction_null_combo_coverage_", filter_cutoff_interaction, "filter.csv")))
+
+realInteraction <- fread(
+  file.path(real_interaction_dir, paste0("glmGamPoi_interaction_lfc_", filter_cutoff_interaction, "filter.csv")),
+  select = c("pval", "adj_pval", "lfc", "interaction")
+) %>%
+  as_tibble() %>%
+  mutate(contrast = "ligand1:ligand2")
+
+realSingles <- fread(
+  file.path(real_interaction_dir, paste0("glmGamPoi_singles_lfc_", filter_cutoff_interaction, "filter.csv")),
+  select = c("pval", "adj_pval", "lfc")
+) %>%
+  as_tibble() %>%
+  mutate(contrast = "ligand")
+```
+
+# Pool p-values across contrasts
+
+```{r}
+nullPvals <- bind_rows(
+  nullInteraction %>% select(contrast, pvalue = pval, adj_pval),
+  nullSingles %>% select(contrast, pvalue = pval, adj_pval)
+) %>%
+  filter(!is.na(pvalue))
+
+nullPvals %>% count(contrast)
+```
+
+```{r}
+allPvals <- bind_rows(
+  bind_rows(realInteraction, realSingles) %>% mutate(source = "real"),
+  bind_rows(nullInteraction, nullSingles) %>% mutate(source = "null")
+) %>%
+  rename(pvalue = pval) %>%
+  filter(!is.na(pvalue))
+
+allPvals %>% count(source, contrast)
+```
+
+# P-value distribution
+
+```{r, fig.width=8, fig.height=4}
+ggplot(nullPvals, aes(x = pvalue)) +
+  geom_histogram(breaks = seq(0, 1, by = 0.05), boundary = 0) +
+  facet_wrap(~contrast, scales = "free_y") +
+  labs(x = "raw p-value (null)", y = "gene-tests", title = "Null p-value distributions by contrast") +
+  theme(aspect.ratio = 1)
+ggsave(file.path(outs_dir, "plots/interaction_scoring_null/glm_pval_histogram_null.pdf"))
+```
+
+```{r, fig.width=8, fig.height=8}
+p1 <- allPvals %>%
+  filter(contrast == "ligand") %>%
+  ggplot(aes(x = pvalue, y = after_stat(density), fill = source)) +
+  geom_histogram(breaks = seq(0, 1, by = 0.02), boundary = 0, position = "identity") +
+  scale_fill_manual(values = c("#666666FF", "#1B9E77FF")) +
+  facet_wrap(~source) +
+  labs(x = "raw p-value", y = "density", fill = NULL,
+       title = "Real vs. null p-value distributions by single coeff.") +
+  theme(aspect.ratio = 1)
+
+p2 <- allPvals %>%
+  filter(contrast == "ligand1:ligand2") %>%
+  ggplot(aes(x = pvalue, y = after_stat(density), fill = source)) +
+  geom_histogram(breaks = seq(0, 1, by = 0.02), boundary = 0, position = "identity") +
+  scale_fill_manual(values = c("#666666FF", "#1B9E77FF")) +
+  facet_wrap(~source) +
+  labs(x = "raw p-value", y = "density", fill = NULL,
+       title = "Real vs. null p-value distributions by interaction coeff.") +
+  theme(aspect.ratio = 1)
+
+p1/p2
+
+ggsave(file.path(outs_dir, "plots/interaction_scoring_null/glm_pval_histogram_real_vs_null.pdf"))
+```
+
+# QQ plots
+
+```{r, fig.width=8, fig.height=4}
+qqData <- nullPvals %>%
+  group_by(contrast) %>%
+  arrange(pvalue, .by_group = TRUE) %>%
+  mutate(
+    n = n(),
+    rank = row_number(),
+    expected = -log10(ppoints(n)),
+    observed = -log10(pvalue),
+    # Beta distribution CI for each order statistic (on the p-value scale)
+    ci_lower = qbeta(0.025, rank, n - rank + 1),
+    ci_upper = qbeta(0.975, rank, n - rank + 1),
+    # transform to -log10 scale; note bounds swap because -log10 is decreasing
+    ci_lower_log = -log10(ci_upper),
+    ci_upper_log = -log10(ci_lower)
+  ) %>%
+  ungroup()
+
+ggplot(qqData, aes(x = expected, y = observed)) +
+  geom_ribbon(aes(ymin = ci_lower_log, ymax = ci_upper_log),
+              fill = "grey70", alpha = 0.4) +
+  geom_point(alpha = 0.5, size = 1, color = "#666666FF") +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  facet_wrap(~contrast, scales = "free_y") +
+  labs(x = expression(-log[10](expected~p)), y = expression(-log[10](observed~p)),
+       title = "Null QQ plots by contrast") +
+  theme(aspect.ratio = 1)
+ggsave(file.path(outs_dir, "plots/interaction_scoring_null/glm_QQ_null.pdf"))
+```
+
+```{r, fig.width=9, fig.height=4}
+set.seed(1)
+
+# keep top points, randomly subsample other points
+# purely for plotting efficiency
+thin_qq <- function(pvalues, keep_top = 4000, n_bulk_sample = 4000) {
+  n <- length(pvalues)
+  sorted_p <- sort(pvalues)
+  rank <- seq_len(n)
+  expected <- -log10((rank - 0.5) / n)
+  observed <- -log10(sorted_p)
+
+  keep_idx <- seq_len(min(keep_top, n))
+  if (n > keep_top) {
+    bulk_idx <- sample(seq(keep_top + 1, n), size = min(n_bulk_sample, n - keep_top))
+    keep_idx <- c(keep_idx, bulk_idx)
+  }
+
+  tibble(expected = expected[keep_idx], observed = observed[keep_idx])
+}
+
+qqOverlay <- allPvals %>%
+  group_by(contrast, source) %>%
+  group_modify(~ thin_qq(.x$pvalue)) %>%
+  ungroup()
+
+ggplot(qqOverlay, aes(x = expected, y = observed, color = source)) +
+  geom_point(alpha = 0.5, size = 1) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  scale_color_manual(values = c("#666666FF", "#1B9E77FF")) +
+  facet_wrap(~contrast, scales = "free") +
+  labs(x = expression(-log[10](expected~p)), y = expression(-log[10](observed~p)), color = NULL,
+       title = "Real vs Null QQ plot by contrast") +
+  theme(aspect.ratio = 1)
+
+ggsave(file.path(outs_dir, "plots/interaction_scoring_null/glm_QQ_real_vs_null.pdf"))
+```
+
+# P-value vs. effect size, real vs. null
+
+```{r, fig.width=12, fig.height=8}
+# keep top points, randomly subsample other points
+# purely for plotting efficiency
+thin_pairs <- function(df, keep_top = 20000, n_bulk_sample = 20000) {
+  n <- nrow(df)
+  df <- df[order(df$pvalue), ]
+  keep_idx <- seq_len(min(keep_top, n))
+  if (n > keep_top) {
+    bulk_idx <- sample(seq(keep_top + 1, n), size = min(n_bulk_sample, n - keep_top))
+    keep_idx <- c(keep_idx, bulk_idx)
+  }
+  df[keep_idx, ]
+}
+
+volcanoData <- allPvals %>%
+  mutate(abs_lfc = abs(lfc)) %>%
+  mutate(contrast_source = paste(contrast, source)) %>%
+  group_by(contrast, source) %>%
+  group_modify(~ thin_pairs(.x)) %>%
+  ungroup()
+
+ggplot(volcanoData, aes(x = abs_lfc, y = -log10(pvalue), color = source)) +
+  geom_point(alpha = 0.3, size = 0.6) +
+  geom_density_2d(linewidth = 0.4) +
+  geom_hline(yintercept = -log10(0.1), linetype = "dashed", color = "grey30") +
+  scale_color_manual(values = c("#666666FF", "#1B9E77FF")) +
+  facet_wrap(~contrast_source) +
+  labs(x = "|log fold-change|", y = expression(-log[10](p~value)), color = NULL,
+       title = "P-value vs. effect size (|lfc|)") +
+  theme(aspect.ratio = 1)
+
+ggsave(file.path(outs_dir, "plots/interaction_scoring_null/glm_pval_vs_effect_scatter.pdf"))
+ggsave(file.path(outs_dir, "plots/interaction_scoring_null/glm_pval_vs_effect_scatter.png"), dpi = 300)
+```
+
+# Effect size comparison among significant hits
+
+Comparison of real analysis's `adj_pval < 0.1` hit effect sizes (`|lfc|`) to the
+null's own `adj_pval < 0.1` hits.
+
+```{r, fig.width=8, fig.height=5}
+sigEffectSizes <- allPvals %>%
+  filter(adj_pval < 0.1) %>%
+  mutate(abs_lfc = abs(lfc))
+
+ggplot(sigEffectSizes, aes(x = contrast, y = abs_lfc, fill = source)) +
+  geom_boxplot(outlier.size = 0.5, position = position_dodge(width = 0.8)) +
+  scale_fill_manual(values = c("#666666FF", "#1B9E77FF")) +
+  labs(x = NULL, y = "|log fold-change|", fill = NULL,
+       title = "Effect sizes among adj_pval < 0.1 hits: real vs. null") +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1),
+        aspect.ratio = 1)
+
+ggsave(file.path(outs_dir, "plots/interaction_scoring_null/glm_effect_boxplot_significant_hits.pdf"))
+```
+
+# P-value Inflation Metrics
+
+## Empirical false-positive rate at the real pipeline's significance cutoff
+
+`interaction_scoring_v3.R` calls a gene significant at `adj_pval < 0.1`
+(nominal 10% FDR). Under a correctly calibrated null, roughly 10% of these
+null gene-tests should fall below that threshold purely by chance.
+
+```{r}
+nullPvals %>%
+  group_by(contrast) %>%
+  summarise(
+    n_tests = n(),
+    n_sig = sum(adj_pval < 0.1, na.rm = TRUE),
+    empirical_fpr = n_sig / n_tests
+  )
+```
+
+## Hit rate at adj_pval < 0.1: real vs. null
+
+```{r}
+hitRates <- allPvals %>%
+  group_by(contrast, source) %>%
+  summarise(n_tests = n(), n_sig = sum(adj_pval < 0.1, na.rm = TRUE), hit_rate = n_sig / n_tests, .groups = "drop")
+
+hitRates
+```
+
+```{r}
+hitRates %>%
+  select(contrast, source, hit_rate) %>%
+  pivot_wider(names_from = source, values_from = hit_rate) %>%
+  dplyr::mutate(fold_enrichment_real_over_null = real / null,
+         empirical_fdr = null/real)
+```
+
+`fold_enrichment_real_over_null` is how many times more often the real
+analysis calls a gene significant than the null does for the same contrast.
+
+`empirical_fdr` is the FPR/(FPR+TPR)
+

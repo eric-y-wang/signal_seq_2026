@@ -1,0 +1,141 @@
+---
+title: "spca_score_concordance_cutoffs"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup}
+library(tidyverse)
+library(patchwork)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Repo-relative paths: inputs are read from imports_stable/, outputs are written to analysis_outs/
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find the repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "02_combinatorial_screen_signalseq_SIG13")
+source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
+theme_set(theme_Publication())
+
+plot_dir <- file.path(outs_dir, "plots/qc_barcode_cutoff")
+# cutoff scores written by 06_spca_waggr_cutoff_scoring.ipynb
+in_dir <- file.path(imports_dir, "SIG13/analysis_outs/qc_barcode_cutoff")
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+
+cutoffs <- 1:10
+ref_cutoff <- 7
+```
+
+# Goal
+
+Do the sPCA component scores that drive the synergy calls change when the doublet population is called at a different DSB cutoff? `06_spca_waggr_cutoff_scoring.ipynb` scored every cutoff against the same loadings, on the same set of `ligand_call x replicate` pseudobulk units.
+
+# Import
+
+```{r}
+scores <- read_csv(file.path(in_dir, "spca_waggr_cutoff_scores_long.csv.gz"), show_col_types = FALSE)
+qc <- read_csv(file.path(in_dir, "spca_waggr_cutoff_qc.csv"), show_col_types = FALSE)
+
+comp_levels <- scores %>%
+  distinct(component) %>%
+  mutate(idx = as.integer(str_remove(component, "comp_"))) %>%
+  arrange(idx) %>%
+  pull(component)
+
+scores <- scores %>%
+  mutate(component = factor(component, levels = comp_levels),
+         cutoff = factor(cutoff, levels = cutoffs))
+
+scores %>% count(cutoff)
+```
+
+```{r}
+ref_scores <- scores %>%
+  filter(cutoff == ref_cutoff) %>%
+  select(unit_id, component, ligand_call, score_ref = score)
+
+cat("pseudobulk units:", n_distinct(ref_scores$unit_id),
+    " components:", n_distinct(ref_scores$component), "\n")
+```
+
+# Concordance with DSB7
+
+```{r}
+vs_ref <- scores %>%
+  filter(cutoff != ref_cutoff) %>%
+  left_join(ref_scores %>% select(unit_id, component, score_ref), by = c("unit_id", "component"))
+
+vs_ref %>%
+  group_by(cutoff) %>%
+  summarise(pearson = cor(score, score_ref),
+            spearman = cor(score, score_ref, method = "spearman"),
+            .groups = "drop")
+```
+
+```{r fig.width=10, fig.height=5}
+p_conc <- vs_ref %>%
+  group_by(cutoff, unit_id) %>%
+  summarise(pearson = cor(score, score_ref),
+            spearman = cor(score, score_ref, method = "spearman"),
+            .groups = "drop") %>%
+  pivot_longer(c(pearson, spearman), names_to = "metric", values_to = "r") %>%
+  ggplot(aes(x = cutoff, y = r, colour = cutoff)) +
+  geom_boxplot(width = 0.6, outlier.size = 0.5) +
+  ylim(0, 1) +
+  facet_wrap(~metric) +
+  theme(aspect.ratio = 1) +
+  scale_color_viridis_d(option = "turbo", end = 0.9) +
+  labs(x = "DSB cutoff", y = "correlation with DSB7 scores",
+       title = "Component scores vs. DSB7 (each point = one pseudobulk unit)")
+
+p_conc
+ggsave(file.path(plot_dir, "spca_score_concordance_cutoffs.pdf"), p_conc, width = 10, height = 5)
+```
+
+```{r fig.width=12, fig.height=3}
+p_scatter <- vs_ref %>%
+  ggplot(aes(x = score_ref, y = score)) +
+  geom_point(size = 0.3, alpha = 0.2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "red") +
+  facet_wrap(~cutoff, nrow = 1) +
+  theme(aspect.ratio = 1) +
+  labs(x = "DSB7 score", y = "cutoff score")
+
+p_scatter
+ggsave(file.path(plot_dir, "spca_score_scatter_cutoffs.pdf"), p_scatter, width = 12, height = 3)
+```
+
+# Pairwise cutoff concordance
+
+```{r fig.width=6, fig.height=5}
+wide <- scores %>%
+  select(unit_id, component, cutoff, score) %>%
+  pivot_wider(names_from = cutoff, values_from = score) %>%
+  select(all_of(as.character(cutoffs)))
+
+pair_mat <- cor(wide, use = "pairwise.complete.obs")
+
+p_heat <- as_tibble(pair_mat, rownames = "cutoff_a") %>%
+  pivot_longer(-cutoff_a, names_to = "cutoff_b", values_to = "r") %>%
+  ggplot(aes(x = cutoff_a, y = cutoff_b, fill = r)) +
+  geom_tile() +
+  geom_text(aes(label = sprintf("%.2f", r)), size = 2.5) +
+  scale_fill_viridis_c(limits = c(0, 1)) +
+  theme(aspect.ratio = 1) +
+  labs(x = "DSB cutoff", y = "DSB cutoff",
+       title = "Component-score correlation between cutoffs")
+
+p_heat
+ggsave(file.path(plot_dir, "spca_score_pairwise_heatmap.pdf"), p_heat, width = 6, height = 5)
+```

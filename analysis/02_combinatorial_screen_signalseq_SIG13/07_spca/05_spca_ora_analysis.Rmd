@@ -1,0 +1,250 @@
+---
+title: "SIG13 sPCA program over-representation analysis"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup}
+library(tidyverse)
+library(patchwork)
+library(viridisLite)
+library(ggrepel)
+library(ComplexHeatmap)
+library(circlize)
+library(RColorBrewer)
+library(scales)
+
+library(clusterProfiler)
+library(msigdbr)
+library(org.Hs.eg.db)
+library(babelgene)
+
+knitr::opts_chunk$set(echo = TRUE)
+set.seed(314)
+```
+
+```{r}
+# Repo-relative paths (inputs: imports_stable/, outputs: analysis_outs/)
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "02_combinatorial_screen_signalseq_SIG13")
+dir.create(file.path(outs_dir, "plots"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(outs_dir, "spca"), recursive = TRUE, showWarnings = FALSE)
+source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
+source(file.path(repo_dir, "functions/r_custom/scRNA_seq_analysis_functions.R"))
+theme_set(theme_Publication())
+interaction_palette <- c("#808080",brewer.pal(5,"Dark2"))
+names(interaction_palette) <- c("none", "additive over saturation", "buffering", 
+                      "buffering complete", "synergy negative", "synergy positive")
+```
+
+# Goal
+
+-   GO enrichment for sPCA genes
+
+# Import
+
+```{r}
+lm_scored <- read_csv(file.path(imports_dir, "SIG13/analysis_outs/spca/lm_scored_zscore_degs_allLigands_0.1_alpha1.0_sPCA_clean.csv"))
+spca_genes <- read_csv(file.path(imports_dir, "SIG13/analysis_outs/spca/zscore_degs_allLigands_0.1_alpha1.0_sPCA_loadings.csv"))
+
+# component order from the hierarchical clustering of the reproducible interactions
+# heatmap in 04_spca_visualization.Rmd, so the ORA plots below use the same component order
+component_order <- read_csv(file.path(imports_dir, "SIG13/analysis_outs/spca/spca_alpha1.0_full_hm_reproducible_row_order.csv")) %>%
+  pull(component)
+```
+
+# Process Input Data
+
+```{r}
+mouse_to_human_genes <- function(genelist){
+  require("babelgene")
+  require("dplyr")
+
+  genelist <- as.character(unlist(genelist))
+
+  orthologs(genes = genelist, species = "human")
+}
+```
+
+
+```{r}
+# filter for clean components
+df <- spca_genes %>%
+  filter(spca_component %in% lm_scored$component)
+
+# get genelist
+genelist <- as.character(unlist(unique(df$gene)))
+
+# get mouse to human conversions
+geneTable <- orthologs(genes = genelist, species = "mouse", human = FALSE) %>%
+  dplyr::rename(gene = symbol,
+                gene_human = human_symbol,
+                ENTREZID = human_entrez)
+
+# join human gene to tibble
+df_merged <- df %>%
+  left_join(geneTable, by="gene")
+```
+
+# Go Enrichment
+
+Here I will compare to the human datasets since they are generally more rich.
+
+```{r}
+# Get MsigDB Hallmark
+hallmark_human <- msigdbr(species = "Homo sapiens", collection = "H")
+ids <- bitr(hallmark_human$ensembl_gene, fromType = "ENSEMBL", toType = "ENTREZID", OrgDb = "org.Hs.eg.db")
+hallmark_human <- hallmark_human %>%
+  inner_join(ids, by=c("ensembl_gene"="ENSEMBL")) %>%
+  dplyr::select(gs_name, ENTREZID)
+```
+
+```{r}
+# kegg enrichment
+res_kegg <- compareCluster(ENTREZID ~ spca_component, 
+                           data = df_merged, 
+                           fun = "enrichKEGG", 
+                           organism = "hsa")
+
+# hallmark enrichment
+res_hallmark <- compareCluster(ENTREZID ~ spca_component, 
+                               data = df_merged, 
+                               fun = "enricher", 
+                               TERM2GENE = hallmark_human)
+
+```
+
+```{r}
+# function to extract tibble from results
+get_enrich_tibble <- function(res_object, n_terms = 5) {
+  res_object %>%
+    as_tibble() %>%
+    mutate(
+      # specific logic to convert "10/100" string to 0.1 numeric
+      GeneRatio_Num = sapply(strsplit(GeneRatio, "/"), 
+                             function(x) as.numeric(x[1]) / as.numeric(x[2]))
+    ) %>%
+    ungroup() %>%
+    mutate(Description = fct_reorder(Description, GeneRatio_Num))
+}
+
+# get results
+kegg_data <- get_enrich_tibble(res_kegg)
+hallmark_data <- get_enrich_tibble(res_hallmark)
+
+# order Cluster (spca_component) to match the hierarchical clustering of the
+# reproducible interactions heatmap; components not in that clustering (e.g. filtered
+# out as replicate-driven or not reproducible) are appended after in their original order
+kegg_data <- kegg_data %>%
+  mutate(Cluster = factor(as.character(Cluster), levels = union(component_order, unique(as.character(Cluster)))))
+hallmark_data <- hallmark_data %>%
+  mutate(Cluster = factor(as.character(Cluster), levels = union(component_order, unique(as.character(Cluster)))))
+
+write_csv(kegg_data, file.path(outs_dir, "spca/zscore_degs_alpha1.0_sPCA_kegg.csv"))
+write_csv(hallmark_data, file.path(outs_dir, "spca/zscore_degs_alpha1.0_sPCA_hallmark.csv"))
+```
+
+```{r, fig.height=6, fig.width=18}
+p1 <- hallmark_data %>%
+  filter(p.adjust < 0.1) %>%
+  group_by(Cluster) %>%
+  summarise(n = n()) %>%
+  ggplot(aes(x = Cluster, y = n)) +
+  geom_col() +
+  scale_x_discrete(drop = FALSE) +
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.5))
+
+p2 <- kegg_data %>%
+  filter(p.adjust < 0.1) %>%
+  group_by(Cluster) %>%
+  summarise(n = n()) %>%
+  ggplot(aes(x = Cluster, y = n)) +
+  geom_col() +
+  scale_x_discrete(drop = FALSE) +
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.5))
+
+p1/p2
+```
+
+
+```{r, fig.height=6, fig.width=18}
+p1 <- hallmark_data %>%
+  filter(p.adjust < 0.1) %>%
+  ggplot(aes(x = Cluster, y = Description, color = GeneRatio_Num)) +
+  geom_point(aes(size = -log10(p.adjust))) +
+  scale_color_viridis_c(limits = c(0, 0.5), oob = scales::squish) +
+  scale_x_discrete(drop = FALSE) +
+  xlab("Gene Ratio") +
+  ylab(NULL) +
+  theme(axis.text.x = element_text(
+    angle = 90,
+    hjust = 1,
+    vjust = 0.5
+  ))
+
+usefulCategories <- c("Cell growth and death", "Signaling molecules and interaction","Immune system","Immune disease","Signal transduction")
+p2 <- kegg_data %>%
+  filter(p.adjust < 0.1) %>%
+  filter(subcategory %in% usefulCategories) %>%
+  ggplot(aes(x = Cluster, y = Description, color = GeneRatio_Num)) +
+    geom_point(aes(size = -log10(p.adjust))) +
+    scale_color_viridis_c() +
+    scale_x_discrete(drop = FALSE) +
+    xlab("Gene Ratio") +
+    ylab(NULL) +
+    theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.5))
+```
+
+```{r, fig.height=16, fig.width=22}
+p1+p2+plot_layout(ncol=1, heights = c(1, 2))
+ggsave(file.path(outs_dir, "plots/go_enrichment_zscore_degs_alpha1.0_sPCA.pdf"))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

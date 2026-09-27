@@ -1,0 +1,359 @@
+---
+title: "SIG16 ATAC: differential accessibility across ligand contrasts"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    html_preview: false
+---
+
+```{r setup}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(DESeq2)
+  library(ggrepel)
+  library(patchwork)
+})
+knitr::opts_chunk$set(echo = TRUE)
+
+# Repo-relative paths (inputs: imports_stable/, outputs: analysis_outs/)
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "04_tnf_interaction_ATACseq_SIG16")
+source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
+theme_set(theme_Publication())
+
+set.seed(1)
+options(ggrepel.max.overlaps = Inf)
+
+idr <- 0.05
+job.name <- paste0("idr-", idr, "/")
+
+IN_DIR   <- file.path(imports_dir, "SIG16/analysis_outs/deseq2-merged-reps", job.name)
+OUT_DIR  <- file.path(outs_dir, "deseq2-merged-reps", job.name)
+PLOT_DIR <- file.path(outs_dir, "plots", "deseq2-merged-reps", job.name)
+
+padj.cutoff <- 0.05
+lfc.cutoff  <- log2(1.5)
+
+# peaks further than this from a TSS are treated as unassigned to a gene
+dist.cutoff <- 50000
+# number of peaks labelled per volcano, taken from each of three sort orders
+label.n <- 5
+
+volcano.colors <- c(significant_neg  = "#800000FF", significant_pos = "#155F83FF",
+                    significant_weak = "#767676FF", not_significant = "#767676FF")
+```
+
+# Goal
+
+Extract the DESeq2 contrasts of interest from the `~ mouse + ligand1 + ligand2 + ligand1:ligand2`
+fit built in `01_deseq2_qc.Rmd`, and draw the per-contrast plot set (MA plot, volcano on raw and
+adjusted p, and per-peak normalized count plots). Volcanoes are not written per contrast: they are
+assembled with `patchwork` into two multi-panel figures at the top of `PLOT_DIR`
+(`volcano-unshrunken-all.pdf`, `volcano-fdr-unshrunken-all.pdf`).
+
+Three kinds of contrast are pulled from the same fit — each single ligand against untreated, the
+pure interaction term, and each combination against untreated:
+
+| mode | question | DESeq2 term | n |
+|---|---|---|---|
+| 1 | effect of `ligand1` alone (ligand2 = none) | `name = ligand1_L1_vs_none` | 3 |
+| 3 | effect of TNF alone (ligand1 = none) | `name = ligand2_TNF_vs_none` | 1 |
+| 5 | pure interaction term | `name = ligand1L1.ligand2TNF` | 3 |
+| 6 | combined condition (`ligand1` + TNF) vs untreated | `contrast = ligand1_L1_vs_none + ligand2_TNF_vs_none + ligand1L1.ligand2TNF` | 3 |
+
+Ten contrasts in all. Mode numbering is kept from the external collaborator's
+`ATAC-analysis/SIG16_ATAC/1-deseq.R`, which also pulled the two conditional simple effects
+(`ligand1` given TNF, and TNF given `ligand1`); those are dropped here because nothing downstream
+consumes them — `03_interaction_classification.Rmd` reads modes 1/3/5/6 and
+`04_motif_enrichment.Rmd` reads modes 1/3 plus the interaction classification.
+
+Because mode 6 is a sum of coefficients it is requested with a `list()` contrast, which DESeq2
+evaluates as an unshrunken Wald test on the summed effect; modes 1/3/5 come straight off
+`resultsNames(dds)`. All results are unshrunken throughout (matching the collaborator's
+`-unshrunken` file suffixes).
+
+Mode 6 is the combined-condition effect ($b_1 + b_2 + b_{int}$, i.e. `{ligand1}_TNF` vs `none_none`).
+It is what `03_interaction_classification.Rmd` uses as `lfc_condition` / `adj_pval_condition`, the
+gate that decides whether a peak responds to the combination at all — matching the joint-condition
+GLM that SIG13 fits alongside its interaction model.
+
+# Import
+
+```{r}
+dds <- readRDS(file.path(IN_DIR, "deseq2_dataset.rds"))
+md  <- readRDS(file.path(IN_DIR, "metadata.rds"))
+
+annot <- read.csv(file.path(imports_dir, "SIG16/analysis_outs/chipseeker", job.name,
+                            "all.peakatlas/annotation.tsv"), sep = "\t")
+pal <- readRDS(file.path(imports_dir, "SIG16/analysis_outs/plots/palette.rds"))
+
+resultsNames(dds)
+```
+
+# Contrast table
+
+```{r}
+ligand2 <- "TNF"
+ligand1s <- c("IL4", "IL6", "TGFb")
+
+make_jobs <- function(l1, l2 = "TNF") {
+  itxn <- paste0("ligand1", l1, ".ligand2", l2)
+  list(
+    # mode 1: ligand1 vs none, when ligand2 = none
+    list(kind = "name",
+         result.name = paste0("ligand1_", l1, "_vs_none"),
+         up.group = l1, down.group = "none",
+         sample.conditions = c("none_none", paste0(l1, "_none"))),
+    # mode 5: pure interaction term
+    list(kind = "name",
+         result.name = itxn,
+         up.group = "synergistic", down.group = "antagonistic",
+         sample.conditions = c("none_none", paste0(l1, "_none"),
+                               paste0(l1, "_", l2), paste0("none_", l2))),
+    # mode 6: combined condition (ligand1 + ligand2) vs untreated == b1 + b2 + b_int
+    list(kind = "contrast",
+         result.name = paste0("condition_", l1, "_", l2, "_vs_none_none"),
+         contrast = list(c(paste0("ligand1_", l1, "_vs_none"),
+                           paste0("ligand2_", l2, "_vs_none"),
+                           itxn)),
+         up.group = paste0(l1, "_", l2), down.group = "none_none",
+         sample.conditions = c("none_none", paste0(l1, "_", l2)))
+  )
+}
+
+jobs <- c(
+  # mode 3: TNF vs none, when ligand1 = none (shared across all ligand1)
+  list(list(kind = "name",
+            result.name = paste0("ligand2_", ligand2, "_vs_none"),
+            up.group = ligand2, down.group = "none",
+            sample.conditions = c("none_none", paste0("none_", ligand2)))),
+  unlist(lapply(ligand1s, make_jobs), recursive = FALSE)
+)
+
+# output subdirectory per job, keyed on how the contrast was requested
+jobs <- lapply(jobs, function(job) {
+  job$pref2 <- paste0(if (job$kind == "contrast") "contrast-" else "name-",
+                      job$result.name, "/")
+  job
+})
+names(jobs) <- vapply(jobs, function(j) j$result.name, character(1))
+
+tibble(contrast = names(jobs),
+       kind = vapply(jobs, function(j) j$kind, character(1)),
+       samples = vapply(jobs, function(j) paste(j$sample.conditions, collapse = ", "),
+                        character(1)))
+```
+
+# Per-contrast analysis
+
+```{r}
+run_contrast <- function(job, save.results = TRUE) {
+  dir.create(file.path(PLOT_DIR, job$pref2), recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(OUT_DIR, job$pref2), recursive = TRUE, showWarnings = FALSE)
+
+  res.table.unshrunken <- if (job$kind == "contrast") {
+    results(dds, contrast = job$contrast, alpha = padj.cutoff)
+  } else {
+    results(dds, name = job$result.name, alpha = padj.cutoff)
+  }
+  # Result table: annotate with nearest gene, drop untested peaks (padj = NA), and
+  # carry the -log10 p columns the volcano is drawn on. Rownames are kept alongside
+  # the `feature` column because the CSV export and plotCounts() both key off them.
+  res.tb <- res.table.unshrunken %>%
+    as.data.frame() %>%
+    rownames_to_column("feature") %>%
+    left_join(annot %>% dplyr::select(feature = name, distanceToTSS, geneSymbol),
+              by = "feature") %>%
+    relocate(feature, .after = geneSymbol) %>%
+    filter(!is.na(padj)) %>%
+    mutate(geneSymbol = ifelse(abs(distanceToTSS) > dist.cutoff, "", geneSymbol),
+           mlog10Pval = -log10(pvalue + 1e-200),
+           mlog10Padj = -log10(padj + 1e-200)) %>%
+    arrange(desc(mlog10Pval)) %>%
+    mutate(peak = feature) %>%
+    column_to_rownames("peak")
+
+  samples <- rownames(md[md$condition %in% job$sample.conditions, ])
+
+  # Significant peaks, labelled by direction. This is the set everything is counted
+  # from, and it is exactly the gate `03_interaction_classification.Rmd` applies to the
+  # interaction term (`sig_int`), so the per-contrast tallies below agree with the
+  # interaction-class counts there.
+  sig <- res.tb %>%
+    filter(abs(log2FoldChange) > lfc.cutoff, padj < padj.cutoff) %>%
+    mutate(cluster = ifelse(log2FoldChange > 0, job$up.group, job$down.group)) %>%
+    arrange(log2FoldChange)
+
+  # Peaks to draw count plots for: one per gene, with mitochondrial and ribosomal genes
+  # dropped. Distal peaks all carry geneSymbol == "" and would collapse into a single
+  # representative, so they are excluded from the labelling set rather than deduplicated.
+  # Never used for counting — see `sig`.
+  markers <- sig %>%
+    filter(geneSymbol != "",
+           !grepl("(^MT-)|(^RPS)|(^RPL)|(^MRPL)|(^MRPS)", toupper(geneSymbol))) %>%
+    group_by(geneSymbol) %>%
+    slice_max(abs(log2FoldChange), n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    arrange(log2FoldChange)
+
+  # Volcano table: significance group per peak, plus the labels — the top `label.n`
+  # by FDR, by most positive LFC, and by most negative LFC.
+  volcano.tb <- res.tb %>%
+    mutate(group = case_when(padj > padj.cutoff              ~ "not_significant",
+                             log2FoldChange >=  lfc.cutoff   ~ "significant_pos",
+                             log2FoldChange <= -lfc.cutoff   ~ "significant_neg",
+                             TRUE                            ~ "significant_weak"),
+           symbol = ifelse(abs(distanceToTSS) <= dist.cutoff & padj <= padj.cutoff,
+                           geneSymbol, ""))
+
+  labelled <- c(volcano.tb %>% arrange(padj) %>% head(label.n) %>% pull(feature),
+                volcano.tb %>% arrange(desc(log2FoldChange)) %>% head(label.n) %>% pull(feature),
+                volcano.tb %>% arrange(log2FoldChange) %>% head(label.n) %>% pull(feature))
+  volcano.tb <- volcano.tb %>%
+    mutate(genelabels = ifelse(feature %in% labelled, symbol, ""))
+
+  # shared layers, so the raw-p and FDR volcanoes differ only in their y aesthetic
+  volcano.layers <- list(
+    geom_vline(xintercept = c(-lfc.cutoff, lfc.cutoff), color = "lightgrey"),
+    geom_point(aes(colour = group), show.legend = FALSE),
+    geom_text_repel(aes(label = genelabels)),
+    scale_color_manual(values = volcano.colors, guide = "none"),
+    labs(title = job$result.name, x = "log2 fold change"),
+    theme(legend.position = "none",
+          plot.title = element_text(hjust = 0.5),
+          axis.title = element_text(face = "bold")))
+
+  volcano.p <- ggplot(volcano.tb, aes(x = log2FoldChange, y = mlog10Pval)) +
+    volcano.layers + ylab("-log10 p-value")
+
+  volcano.fdr.p <- ggplot(volcano.tb, aes(x = log2FoldChange, y = mlog10Padj)) +
+    volcano.layers + ylab("-log10 p.adj") +
+    geom_hline(yintercept = -log10(padj.cutoff), color = "lightgrey")
+
+  if (save.results) {
+    write.csv(md, file.path(OUT_DIR, job$pref2, "metadata.csv"), quote = FALSE)
+    write.csv(res.tb, file.path(OUT_DIR, job$pref2, "unshrunken-res.table.csv"), quote = FALSE)
+    saveRDS(res.tb, file.path(OUT_DIR, job$pref2, "unshrunken-res.table.rds"))
+
+    pdf(file.path(PLOT_DIR, job$pref2, "ma-plot-unshrunken.pdf"))
+    plotMA(res.table.unshrunken, main = job$result.name, cex = 0.5)
+    invisible(dev.off())
+  }
+
+  list(job = job, res = res.table.unshrunken, res.tb = res.tb, samples = samples,
+       sig = sig, markers = markers,
+       volcano.p = volcano.p, volcano.fdr.p = volcano.fdr.p)
+}
+```
+
+Per-peak normalized count plots for the top 20 gained and top 20 lost peaks. These are
+written to multi-page PDFs rather than shown inline.
+
+```{r}
+save_count_plots <- function(r, direction = c("pos", "neg"), n.max = 20) {
+  direction <- match.arg(direction)
+  job <- r$job
+  plot.markers <- if (direction == "pos") {
+    r$markers %>% arrange(desc(log2FoldChange)) %>% subset(log2FoldChange > 0)
+  } else {
+    r$markers %>% arrange(log2FoldChange) %>% subset(log2FoldChange < 0)
+  }
+  if (nrow(plot.markers) == 0) return(invisible(NULL))
+
+  n.plots <- min(nrow(plot.markers), n.max)
+  count.plots <- lapply(seq_len(n.plots), function(i) {
+    gene   <- plot.markers$feature[i]
+    symbol <- plot.markers$geneSymbol[i]
+    counts_data <- plotCounts(dds, gene = gene, intgroup = c("ligand1", "ligand2"),
+                              returnData = TRUE)
+    counts_data$interaction_group <- interaction(counts_data$ligand1, counts_data$ligand2)
+    counts_data <- counts_data[r$samples, ]
+
+    ggplot(counts_data, aes(x = interaction_group, y = count,
+                            color = ligand1, shape = ligand2)) +
+      geom_jitter(size = 3, height = 0, width = 0.2) +
+      scale_y_log10() +
+      scale_color_manual(values = pal$ligand1) +
+      labs(title = paste0(gene, " - ", symbol), x = "Group", y = "Normalized Count")
+  })
+
+  pdf(file.path(PLOT_DIR, job$pref2, paste0("counts-unshrunken-", direction, ".pdf")),
+      width = 6, height = 4)
+  for (p in count.plots) print(p)
+  invisible(dev.off())
+}
+```
+
+```{r, results='asis', fig.width=8, fig.height=6, message=FALSE, warning=FALSE}
+results_list <- list()
+
+for (nm in names(jobs)) {
+  cat("\n\n## ", nm, "\n\n", sep = "")
+  r <- run_contrast(jobs[[nm]])
+  results_list[[nm]] <- r
+
+  n.up   <- sum(r$sig$cluster == r$job$up.group)
+  n.down <- sum(r$sig$cluster == r$job$down.group)
+  cat("`", r$job$up.group, "` (up): ", n.up,
+      " peaks; `", r$job$down.group, "` (down): ", n.down,
+      " peaks at padj < ", padj.cutoff, ", |LFC| > log2(1.5).\n\n", sep = "")
+
+  plotMA(r$res, main = nm, cex = 0.5)
+
+  save_count_plots(r, "pos")
+  save_count_plots(r, "neg")
+}
+```
+
+# Combined volcano panels
+
+All 10 contrasts on one page, raw p on top figure and FDR on the second, assembled with
+`patchwork` (4 columns). Written to `PLOT_DIR` rather than the per-contrast directories.
+
+```{r, fig.width=20, fig.height=19}
+volcano_panel <- function(which.p) {
+  ps <- lapply(results_list, function(r) {
+    r[[which.p]] + theme(legend.position = "none") +
+      labs(title = r$job$result.name)
+  })
+  wrap_plots(ps, ncol = 4)
+}
+
+volcano.all.p     <- volcano_panel("volcano.p")
+volcano.fdr.all.p <- volcano_panel("volcano.fdr.p")
+
+ggsave(file.path(PLOT_DIR, "volcano-unshrunken-all.pdf"),
+       volcano.all.p, width = 20, height = 19, limitsize = FALSE)
+ggsave(file.path(PLOT_DIR, "volcano-fdr-unshrunken-all.pdf"),
+       volcano.fdr.all.p, width = 20, height = 19, limitsize = FALSE)
+
+volcano.all.p
+volcano.fdr.all.p
+```
+
+Heatmaps are not drawn here. All accessibility heatmaps live in
+`03_interaction_classification.Rmd`, where rows can be faceted by interaction class — see the
+"Heatmaps" section there.
+
+# Summary
+
+```{r}
+map_dfr(results_list, function(r) {
+  tibble(contrast = r$job$result.name,
+         tested_peaks = nrow(r$res.tb),
+         up = sum(r$sig$cluster == r$job$up.group),
+         down = sum(r$sig$cluster == r$job$down.group),
+         up_group = r$job$up.group,
+         down_group = r$job$down.group)
+})
+```

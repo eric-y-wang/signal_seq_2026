@@ -1,0 +1,283 @@
+---
+title: "SIG17 CRISPR screen — UMI clone representation (Gata3 arm)"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(patchwork)
+library(ggrepel)
+library(RColorBrewer)
+library(scales)
+library(jsonlite)
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# Repo-relative paths: inputs from imports_stable/, outputs to analysis_outs/
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "06_crispr_screen_tgfb_tnf_gata3_SIG17")
+```
+
+```{r theme}
+source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
+dir.create(file.path(outs_dir, "crispr_screen_tgfb_tnf_gata3"), recursive = TRUE, showWarnings = FALSE)
+theme_set(theme_Publication())
+```
+
+# Goal
+
+Quantify how many **UMI clones** (independent transduced cells) support each gene
+in each sorted bin of the Gata3 arm of the SIG17 screen (TGFb + TNF condition,
+samples `SIG17_1-4`; bin 1 = lowest GATA3-reporter, bin 4 = highest).
+
+Sequencing is saturated in this experiment — every bin has a duplication rate of
+~99%, i.e. each original molecule was resequenced ~100x on average (confirmed in
+the last section). A UMI cluster count is therefore an **absolute count of cells
+carrying that sgRNA**, not a subsample of them.
+
+# Import
+
+```{r import}
+pipe_dir  <- file.path(imports_dir, "SIG17/dedup_pipeline_output")
+dedup_dir <- file.path(pipe_dir, "02_guide_dedup")
+
+# Gata3 arm: SIG17_1-4 == GATA3-reporter bins 1-4 (low -> high)
+bin_samples <- c(`1` = "SIG17_1", `2` = "SIG17_2",
+                 `3` = "SIG17_3", `4` = "SIG17_4")
+
+# per-sgRNA UMI QC emitted by ../01_processing/02_guide_dedup.py
+sg <- imap_dfr(bin_samples, function(s, b) {
+  read_tsv(file.path(dedup_dir, paste0(s, ".umi_per_guide.tsv")),
+           show_col_types = FALSE) %>%
+    mutate(sample = s, bin = as.integer(b))
+}) %>%
+  mutate(
+    # controls have 47 guides each vs 4 for a targeting gene, so they are never
+    # pooled into gene-level sums -- they are carried as their own series.
+    category = case_when(
+      gene == "control_NT"      ~ "control_NT",
+      gene == "control_cutting" ~ "control_cutting",
+      TRUE                      ~ "targeting"
+    ),
+    bin_lab = factor(paste("bin", bin), levels = paste("bin", 1:4))
+  )
+
+# per-sample dedup summary + clone-size histogram
+stats_raw <- map(bin_samples, ~ fromJSON(file.path(dedup_dir, paste0(.x, ".dedup_stats.json"))))
+
+bin_stats <- imap_dfr(stats_raw, function(d, b) {
+  tibble(
+    bin               = as.integer(b),
+    total_reads       = d$total_reads,
+    guide_matched     = d$guide_matched,
+    umi_clusters      = d$total_umi_clusters,
+    unique_umis_raw   = d$total_unique_umis_raw,
+    duplication_rate  = d$duplication_rate,
+    clone_size_mean   = d$clone_size_mean,
+    clone_size_median = d$clone_size_median,
+    singletons        = d$clone_size_singletons,
+    guides_detected   = d$unique_guides_detected
+  )
+}) %>%
+  mutate(bin_lab = factor(paste("bin", bin), levels = paste("bin", 1:4)))
+
+bin_stats
+```
+
+# Mean UMI clones per gene across bins
+
+Left panel is on the **per-sgRNA** scale so targeting genes and the two control
+guide sets are directly comparable — the control lines are the reference for how
+many cells a non-perturbing guide puts in each bin, so the bin-to-bin shape of
+the targeting mean should be read against the control shape. Right panel is the
+per-gene total (sum of 4 sgRNAs), the quantity that sets statistical power for a
+gene-level test in that bin.
+
+```{r gene-level}
+# gene-level clone counts: sum over a gene's sgRNAs (targeting genes only)
+gene_clones <- sg %>%
+  filter(category == "targeting") %>%
+  group_by(gene, bin, bin_lab) %>%
+  summarise(clones       = sum(umi_clusters),
+            clones_per_sg = mean(umi_clusters),
+            n_sg          = n(),
+            .groups = "drop")
+
+# control sgRNA sets, kept on the per-sgRNA scale
+control_clones <- sg %>%
+  filter(category != "targeting") %>%
+  select(series = category, sgRNA_id, bin, bin_lab, clones_per_sg = umi_clusters)
+```
+
+```{r p1, fig.width=11, fig.height=4.5}
+mean_ci <- function(x) {
+  n <- sum(!is.na(x)); m <- mean(x, na.rm = TRUE)
+  se <- sd(x, na.rm = TRUE) / sqrt(n)
+  tibble(mean = m, lo = m - 1.96 * se, hi = m + 1.96 * se, n = n)
+}
+
+# combined per-sgRNA-scale series
+per_sg_series <- bind_rows(
+  gene_clones %>% transmute(series = "targeting genes", bin, bin_lab, clones_per_sg),
+  control_clones %>% transmute(series, bin, bin_lab, clones_per_sg)
+)
+
+per_sg_summ <- per_sg_series %>%
+  group_by(series, bin, bin_lab) %>%
+  reframe(mean_ci(clones_per_sg))
+
+series_cols <- c("targeting genes" = "grey20",
+                 "control_cutting" = "#E41A1C",
+                 "control_NT"      = "#377EB8")
+
+p1a <- ggplot(per_sg_summ, aes(bin_lab, mean, colour = series, group = series)) +
+  geom_line(linewidth = 0.7) +
+  geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.12, linewidth = 0.6) +
+  geom_point(size = 2.4) +
+  scale_colour_manual(values = series_cols) +
+  ylim(0,250) +
+  labs(x = NULL, y = "UMI clones per sgRNA\n(mean ± 95% CI)",
+       title = "Clones per sgRNA", colour = NULL) +
+  theme(aspect.ratio = 1)
+
+gene_summ <- gene_clones %>%
+  group_by(bin, bin_lab) %>%
+  reframe(mean_ci(clones))
+
+p1b <- ggplot(gene_summ, aes(bin_lab, mean, group = 1)) +
+  geom_line(linewidth = 0.7, colour = "grey20") +
+  geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.12, linewidth = 0.6,
+                colour = "grey20") +
+  geom_point(size = 2.4, colour = "grey20") +
+  ylim(0,800) +
+  labs(x = NULL, y = "UMI clones per gene\n(mean ± 95% CI)",
+       title = "Clones per gene") +
+  theme(aspect.ratio = 1)
+
+p1a + p1b
+ggsave(file.path(outs_dir, "crispr_screen_tgfb_tnf_gata3/clone_mean_per_bin.pdf"))
+```
+
+# Clone distribution per gene, per bin
+
+```{r p2, fig.width=8, fig.height=8}
+p2a <- ggplot(gene_clones, aes(bin_lab, clones)) +
+  geom_violin(fill = "grey85", colour = "grey50", scale = "width",
+              linewidth = 0.4) +
+  geom_boxplot(width = 0.13, outlier.size = 0.4, outlier.alpha = 0.4,
+               linewidth = 0.4) +
+  scale_y_log10(labels = comma) +
+  annotation_logticks(sides = "l") +
+  labs(x = NULL, y = "UMI clones per gene",
+       title = "Per-gene clone distribution") +
+  theme(aspect.ratio = 1)
+
+p2b <- ggplot(gene_clones, aes(clones, colour = bin_lab)) +
+  stat_ecdf(linewidth = 0.7) +
+  scale_x_log10(labels = comma) +
+  annotation_logticks(sides = "b") +
+  scale_colour_brewer(palette = "Set2") +
+  labs(x = "UMI clones per gene", y = "fraction of genes",
+       colour = NULL, title = "Cumulative distribution") +
+  theme(aspect.ratio = 1)
+
+p2c <- ggplot(sg, aes(bin_lab, umi_clusters)) +
+  geom_violin(fill = "grey85", colour = "grey50", scale = "width",
+              linewidth = 0.4) +
+  geom_boxplot(width = 0.13, outlier.size = 0.4, outlier.alpha = 0.4,
+               linewidth = 0.4) +
+  scale_y_log10(labels = comma) +
+  annotation_logticks(sides = "l") +
+  labs(x = NULL, y = "UMI clones per sgRNA",
+       title = "Per-sgRNA clone distribution") +
+  theme(aspect.ratio = 1)
+
+p2d <- ggplot(sg, aes(umi_clusters, colour = bin_lab)) +
+  stat_ecdf(linewidth = 0.7) +
+  scale_x_log10(labels = comma) +
+  annotation_logticks(sides = "b") +
+  scale_colour_brewer(palette = "Set2") +
+  labs(x = "UMI clones per sgRNA", y = "fraction of sgRNA",
+       colour = NULL, title = "Cumulative distribution") +
+  theme(aspect.ratio = 1)
+
+p2a + p2b + p2c + p2d + plot_layout(ncol = 2)
+ggsave(file.path(outs_dir, "crispr_screen_tgfb_tnf_gata3/clone_distribution_per_bin.pdf"))
+```
+
+# Assumption check: is sequencing saturated?
+
+The informative quantity is **reads per clone**: if even the most abundant sgRNAs are
+resequenced many times per molecule, no clone is being missed for want of reads.
+
+```{r p4, fig.width=6, fig.height=4.5}
+sat <- sg %>%
+  filter(umi_clusters > 0, reads_matched > 0) %>%
+  mutate(reads_per_clone = reads_matched / umi_clusters)
+
+p4 <- ggplot(sat, aes(umi_clusters, reads_per_clone, colour = bin_lab)) +
+  geom_point(size = 0.5, alpha = 0.25) +
+  geom_smooth(method = "loess", se = FALSE, linewidth = 0.8) +
+  geom_hline(yintercept = 10, linetype = "dashed", colour = "grey40") +
+  scale_x_log10(labels = comma) +
+  scale_y_log10(labels = comma) +
+  annotation_logticks() +
+  scale_colour_brewer(palette = "Set2") +
+  labs(x = "UMI clones per sgRNA", y = "reads per clone",
+       colour = NULL,
+       title = "Sequencing redundancy across\nsgRNA abundance range",
+       subtitle = "dashed: 10 reads per clone") +
+  theme(aspect.ratio = 1)
+
+p4
+ggsave(file.path(outs_dir, "crispr_screen_tgfb_tnf_gata3/clone_sequencing_saturation.pdf"))
+```
+
+```{r sat-summary}
+n_lib_guides <- nrow(read_csv("../01_processing/mageck_library.csv",
+                              col_names = c("sgRNA_id", "sequence", "gene"),
+                              show_col_types = FALSE))
+
+bin_stats %>%
+  transmute(
+    bin_lab,
+    reads_per_clone = round(guide_matched / umi_clusters, 1),
+    duplication_rate = percent(duplication_rate, accuracy = 0.01),
+    clone_size_median,
+    guides_detected,
+    guides_missing = n_lib_guides - guides_detected
+  )
+```
+
+Every bin sequences each clone ~100x over, so the clone counts above are taken
+as absolute cell counts throughout.
+
+# Summary
+
+```{r summary-table}
+gene_clones %>%
+  group_by(bin_lab) %>%
+  summarise(mean_clones_per_gene = round(mean(clones)),
+            median_clones_per_gene = median(clones),
+            min_clones_per_gene = min(clones), .groups = "drop") %>%
+  left_join(
+    control_clones %>%
+      group_by(bin_lab) %>%
+      summarise(median_control_per_sg = median(clones_per_sg), .groups = "drop"),
+    by = "bin_lab") %>%
+  left_join(select(bin_stats, bin_lab, total_clones = umi_clusters,
+                   reads_per_clone = clone_size_mean) %>%
+              mutate(reads_per_clone = round(reads_per_clone)),
+            by = "bin_lab")
+```

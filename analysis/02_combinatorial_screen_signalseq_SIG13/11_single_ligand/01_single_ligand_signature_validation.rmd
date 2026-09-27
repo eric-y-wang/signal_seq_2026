@@ -1,0 +1,295 @@
+---
+title: "SIG13 ligand validation"
+author: "Ian Zumpano"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+# Goal: verify that cytokine signaling is consistent with other publicly avaliable datasets
+
+```{r message=FALSE, warning=FALSE}
+# install.packages("BiocManager")
+# BiocManager::install(c("fgsea", "msigdbr", "clusterProfiler", "org.Mm.eg.db"))
+
+library(tidyverse)
+library(msigdbr)
+library(dplyr)
+library(tibble)
+library(org.Mm.eg.db)
+library(fgsea)
+```
+
+```{r}
+# Repo-relative paths: inputs from imports_stable/, outputs to analysis_outs/
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "02_combinatorial_screen_signalseq_SIG13")
+dir.create(file.path(outs_dir, "plots"), showWarnings = FALSE, recursive = TRUE)
+source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
+theme_set(theme_Publication())
+```
+
+# Load Data
+
+```{r}
+# data <- read.csv(file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/glmGamPoi_single_term/glmGamPoi_singleTerm_lfc_0.1filter.csv"))
+```
+
+
+## To start, filter for single ligand conditions (linker)
+
+```{r}
+# linkers <- data %>% filter(grepl("linker", condition))
+# 
+# # Get new column with just ligand (eg IL12_linker or linker_IL12 -> IL12)
+# 
+# linkers$ligand <- sub("^linker_|_linker$", "", linkers$condition)
+# 
+# # Create new variable that is -log10(padj) x lfc then rank significant genes based on this
+# 
+# linkers <- linkers %>% mutate(lfc_x_padj = (lfc * -log10(adj_pval)))
+```
+
+
+```{r}
+# write_csv(linkers, file.path(outs_dir, "ligand_signature_validation_linkers.csv"))
+```
+
+
+```{r}
+linkers <- read_csv(file.path(imports_dir, "SIG13/analysis_outs_zumpano/ligand_signature_validation_linkers.csv"))
+```
+
+
+# Run GSEA on Hallmark gene sets. 
+
+Run the different conditions for the same ligands separate (eg \_linker or linker\_ as individual searches), validate results between paired conditions. Note: for TGFb - use only TGFb_linker for analysis, but run both.  
+
+For each condition, input to GSEA is a ranked list of all genes ranked by lfc.
+
+```{r}
+# Define helper function to get hallmark 
+
+run_gsea_for_linkers <- function(linkers, pathways) {
+  ligands <- linkers$ligand %>% unique()
+  results_all <- data.frame()  # container for all results
+  
+  for (lig in ligands) {
+    ligand_data <- linkers %>% filter(ligand == lig)
+    treatments <- ligand_data$condition %>% unique()
+    
+    for (treatment in treatments) {
+      gsea_data <- ligand_data %>% filter(condition == treatment) %>% 
+        arrange(desc(lfc_x_padj))
+
+      # Skip if no genes pass filtering
+      if (nrow(gsea_data) == 0) next
+
+      gsea_ranks <- gsea_data$lfc
+      names(gsea_ranks) <- gsea_data$name
+
+      score_type <- if (all(gsea_ranks > 0)) "pos" else "std"
+
+      fgsea_res <- fgsea(
+        pathways = pathways,
+        stats = gsea_ranks,
+        minSize = 10,
+        maxSize = 500,
+        nPermSimple = 10000,
+        scoreType = score_type
+      )
+
+      # Append ligand and condition to results
+      fgsea_res <- fgsea_res %>% mutate(ligand = lig, condition = treatment) %>%
+        arrange(padj) %>% relocate(ligand, condition, .before = everything())
+
+      # Add to the master results table
+      results_all <- bind_rows(results_all, fgsea_res)
+    }
+  }
+  
+  return(results_all)
+}
+```
+
+```{r}
+msigdbr_mouse_hallmark <- msigdbr(species = "Mus musculus", category = "H")
+hallmark_pathways <- split(msigdbr_mouse_hallmark$gene_symbol, msigdbr_mouse_hallmark$gs_name)
+
+# hallmark_results <- run_gsea_for_linkers(linkers, pathways = hallmark_pathways)
+# sig_hallmark_results <- hallmark_results %>% filter(padj < 0.1)
+```
+
+
+```{r}
+# # Write GSEA Results
+# write_csv(hallmark_results, file.path(outs_dir, "hallmark_gsea_results.csv"))
+# write_csv(sig_hallmark_results, file.path(outs_dir, "significant_hallmark_gsea_results.csv"))
+```
+
+
+```{r}
+hallmark_results <- read_csv(file.path(imports_dir, "SIG13/analysis_outs_zumpano/hallmark_gsea_results.csv"))
+sig_hallmark_results <- read_csv(file.path(imports_dir, "SIG13/analysis_outs_zumpano/significant_hallmark_gsea_results.csv"))
+```
+
+
+## Create a function to measure similarity between significant hits in conditions of same ligands
+
+Goal is to verify that there is consistency between \_linker and linker\_ conditions.
+
+```{r}
+library(dplyr)
+library(purrr)
+
+jaccard_from_lists <- function(df) {
+  
+  # Get unique ligands
+  ligands <- unique(df$ligand)
+  
+  results <- map_dfr(ligands, function(lig) {
+    # Subset for this ligand
+    sub_df <- df %>% filter(ligand == lig)
+    
+    # Split by condition and pull pathways
+    cond_sets <- sub_df %>%
+      group_by(condition) %>%
+      summarise(pathways = list(unique(pathway)), .groups = "drop") %>%
+      pull(pathways)
+    
+    # Only compute if exactly two conditions
+    if (length(cond_sets) != 2) {
+      tibble(ligand = lig, jaccard = NA_real_)
+    } else {
+      # Compute Jaccard
+      inter_len <- length(intersect(cond_sets[[1]], cond_sets[[2]]))
+      union_len <- length(union(cond_sets[[1]], cond_sets[[2]]))
+      tibble(ligand = lig, jaccard = inter_len / union_len)
+    }
+  })
+  
+  return(results)
+}
+
+# Usage
+jaccard_from_lists(sig_hallmark_results) %>% arrange(desc(jaccard))
+```
+
+There is some variation but for the most part looks like there is consistency between \_linker and linker\_ conditions
+
+
+# Plot hallmark gene sets
+
+For plotting, use \_linker conditions only.
+
+```{r}
+data_to_plot <- sig_hallmark_results %>% filter(grepl("_linker", condition))
+```
+
+## Dotplot of all Hallmark pathways
+
+```{r}
+library(ggplot2)
+
+ggplot(data_to_plot, aes(x = condition, y = pathway, size = -log10(padj), color = NES)) +
+  geom_point() +
+  scale_size_continuous(name = "-log10 padj") +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, name = "NES") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 8)
+  ) +
+  labs(x = "Combination", y = "Pathway", title = "GSEA Dotplot")
+```
+
+## Filter for hallmark pathways that correspond to ligands in the data. 
+
+```{r}
+cytokine_strings <- c("INTERFERON", "IL2", "TNF", "_IL", "STAT", "INFLAMMATORY", "MYC", "TGF")
+filtered_dotplot_data <- data_to_plot %>%
+      filter(str_detect(pathway, paste(cytokine_strings, collapse = "|")))
+filtered_dotplot_data$pathway %>% unique()
+```
+
+
+```{r}
+library(ggplot2)
+
+ggplot(filtered_dotplot_data, aes(x = condition, y = pathway, size = -log10(padj), color = NES)) +
+  geom_point() +
+  scale_size_continuous(name = "-log10 padj") +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, name = "NES") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 8)
+  ) +
+  labs(x = "Combination", y = "Pathway", title = "GSEA Results by Ligand")
+```
+
+# GSEA Enrichment Plots
+
+Make gsea enrichment plots for each ligand x pathway combination - eg TNF_linker and hallmark_TNF.
+
+```{r}
+pairs_to_plot <- tibble(
+  treatment = c("IFNG_linker", "IL6_linker", "IL2_linker", "TNF_linker", "TGFB1_linker", "IL27_linker"),
+  pathway     = c("HALLMARK_INTERFERON_GAMMA_RESPONSE", 
+                  "HALLMARK_IL6_JAK_STAT3_SIGNALING", 
+                  "HALLMARK_IL2_STAT5_SIGNALING", 
+                  "HALLMARK_TNFA_SIGNALING_VIA_NFKB", 
+                  "HALLMARK_TGF_BETA_SIGNALING",
+                  "HALLMARK_INTERFERON_GAMMA_RESPONSE"))
+```
+
+
+```{r}
+library(dplyr)
+library(purrr)
+library(fgsea)
+
+enrichment_plots <- pairs_to_plot %>%
+  pmap(function(treatment, pathway) {
+    # subset ligand-specific data
+    ligand_data <- linkers %>% filter(condition == treatment)
+    
+    # rank genes
+    gsea_data <- ligand_data %>% arrange(desc(lfc_x_padj))
+    gsea_ranks_to_plot <- gsea_data$lfc
+    names(gsea_ranks_to_plot) <- gsea_data$name
+    
+    # get pathway-specific results
+    hallmark_results_to_plot <- hallmark_results %>%
+      filter(condition == treatment, pathway == !!pathway)
+    
+    # make enrichment plot
+    plotEnrichment(hallmark_pathways[[pathway]], gsea_ranks_to_plot) +
+      labs(
+        title = paste0(treatment, " + ", pathway),
+        subtitle = paste0(
+          "NES = ", round(hallmark_results_to_plot$NES, 2),
+          ", padj = ", signif(hallmark_results_to_plot$padj, 2)
+        )
+      )
+  })
+```
+
+```{r, fig.height=8, fig.width=10}
+library(patchwork)
+
+# Arrange plots in 2x3 grid
+wrap_plots(enrichment_plots, ncol = 3, nrow = 2)
+ggsave(file.path(outs_dir, "plots/gsea_res.pdf"))
+```

@@ -1,0 +1,649 @@
+---
+title: "Inference Model Calibration Testing"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup}
+library(tidyverse)
+library(patchwork)
+library(purrr)
+library(ggrepel)
+library(RColorBrewer)
+
+library(broom)
+library(yardstick)
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Repo-relative paths (inputs: imports_stable/, outputs: analysis_outs/)
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "03_activity_inference_model")
+dir.create(file.path(outs_dir, "plots/inference_model_calibration"), recursive = TRUE, showWarnings = FALSE)
+
+source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
+theme_set(theme_Publication())
+tab10_colors <- tableau_color_pal(palette = "Tableau 10")(10)
+```
+
+# Goal
+
+Calculate activity differences using linear models based on activity scores from SIG14 and SIG26 (calculated in "02_calibration_input_scoring.py") and then perform ROC analysis and view individual estimates to determine sensitivity and specificity of models with different parameters.
+
+# SIG14 Calibration Results
+
+```{r}
+activity_combined <- read_csv(file.path(imports_dir, "SIG13/analysis_outs/inference_model_calibration/activity_combined_SIG14.csv"))
+```
+
+```{r}
+# tibble to map stimulations to activities
+mapping_tibble <- tibble(
+  stim = c(
+    'IFNg_TNF', 'IFNg_none', 'IL21_CCL19', 'IL21_CCL21A', 'IL21_IL1B', 
+    'IL21_TNF', 'IL21_none', 'IL27_TNF', 'IL27_none', 'IL2_TNF', 
+    'IL2_none', 'IL4_TNF', 'IL4_none', 'IL6_IL1B', 
+    'IL6_TNF', 'IL6_none', 'TGFb_TNF', 'TGFb_none', 'none_CCL19', 'none_CCL21A', 'none_TNF'
+  ),
+  activity = c(
+    'IL27_TNF_c', 'IFNG_c', 'IL21_CCL21A_c', 'IL21_CCL21A_c', 'IL21_IL1B_c', 
+    'IL6_TNFSF18_c', 'IL21_c', 'IL27_TNF_c', 'IL27_c', 'IL2_TNFSF18_c', 
+    'IL2_c', 'IL4_TNFSF18_c', 'IL4_c', 'IL21_IL1B_c', 
+    'IL6_TNFSF18_c', 'IL21_c', 'TGFB1_TNFSF18_c','TGFB1', 'CCL19_c', 'CCL19_c', 'TNFSF18_c'
+  )
+)
+```
+
+```{r}
+# for each activity and model, perform linear modeling to quantify activity differences
+activity_out <- tibble()
+for(m in unique(activity_combined$model)) {
+  df <- activity_combined %>%
+    filter(model == m) %>%
+    separate_wider_delim(sample, "_", names = c("ligand1", "ligand2", "mouse", "well")) %>%
+    mutate(condition = factor(paste0(ligand1, "_", ligand2))) %>%
+    mutate(condition = relevel(condition, ref = "none_none"))
+  for(y_var in unique(mapping_tibble$activity)) {
+    # define pos and negative conditions
+    pos_ligands <- mapping_tibble %>%
+      filter(activity == y_var) %>%
+      pull(stim)
+    neg_ligands <- mapping_tibble %>%
+      filter(activity != y_var) %>%
+      pull(stim)
+    # run lm
+    out <- lm(as.formula(paste0(y_var, '~ condition')), df) %>%
+      broom::tidy() %>%
+      filter(grepl("condition", term)) %>%
+      mutate(term = gsub("condition", "", term)) %>%
+      mutate(
+        category = case_when(
+          term %in% pos_ligands ~ "true_activity",
+          term %in% neg_ligands ~ "other_activity"
+        ),
+        model = m,
+        target_activity = y_var
+      ) %>%
+      mutate(padj = p.adjust(p.value))
+    
+    activity_out <- bind_rows(activity_out, out)
+  }
+}
+activity_out <- activity_out %>%
+  mutate(interaction_cat = ifelse(grepl("none",term),"single","combinatorial"),
+         pscore = -log10(padj))
+```
+
+## ROC analysis
+
+```{r}
+# Calculate and visualize ROC curves by model
+activity_out %>%
+  filter(!is.na(category)) %>%
+  mutate(category = factor(category, levels = c("true_activity", "other_activity"))) %>%
+  group_by(model) %>%
+  roc_curve(category, estimate) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color = model)) +
+  geom_path(linewidth = 1) +
+  geom_abline(lty = 3, color = "grey50") +
+  scale_color_manual(values = tab10_colors) +
+  coord_equal() +
+  ggtitle("Ridge Regression ROC")
+
+# Calculate AUC values for each model
+activity_out %>%
+  filter(!is.na(category)) %>%
+  mutate(category = factor(category, levels = c("true_activity", "other_activity"))) %>%
+  group_by(model) %>%
+  roc_auc(category, estimate)
+
+ggsave(file.path(outs_dir, "plots/inference_model_calibration/model_testing_ROC_SIG14.pdf"))
+```
+
+```{r}
+# retain SIG14 results for the joint SIG14 + SIG26 ROC comparison below
+activity_out_SIG14 <- activity_out
+```
+
+## Per-condition accuracy
+
+The ROC/AUC above pools every ligand/pair together, which can hide conditions the model fails on. Instead, for each `model x stimulation` group, rank every predicted activity estimate and ask where the true-activity condition falls: `percent_rank()` puts the highest estimate at 1, so a true-activity row near 1 means the model correctly picked that condition out from all the others tested for that activity. We also compare the raw estimate and significance of enrichment for true and false activities.
+
+```{r}
+activity_out <- activity_out %>%
+  group_by(model, term) %>%
+  mutate(estimate_percentile = percent_rank(estimate),
+         pscore_percentile = percent_rank(-log10(padj))) %>%
+  ungroup()
+```
+
+```{r, fig.height=8, fig.width=10}
+p1 <- activity_out %>%
+  filter(model == "ridge_zscore_50_weighted") %>%
+  filter(!is.na(category)) %>%
+  ggplot(aes(x = category, y = estimate)) +
+  geom_boxplot(aes(fill = interaction_cat)) +
+  theme(aspect.ratio=1)
+
+p2 <- activity_out %>%
+  filter(model == "ridge_zscore_50_weighted") %>%
+  filter(!is.na(category)) %>%
+  ggplot(aes(x = category, y = estimate)) +
+  geom_boxplot() +
+  theme(aspect.ratio=1)
+
+p3 <- activity_out %>%
+  filter(model == "ridge_zscore_50_weighted") %>%
+  filter(!is.na(category)) %>%
+  ggplot(aes(x = category, y = -log10(padj))) +
+  geom_boxplot(aes(fill = interaction_cat)) +
+  theme(aspect.ratio=1)
+
+p4 <- activity_out %>%
+  filter(model == "ridge_zscore_50_weighted") %>%
+  filter(!is.na(category)) %>%
+  ggplot(aes(x = category,  y = -log10(padj))) +
+  geom_boxplot() +
+  theme(aspect.ratio=1)
+
+p1+p2+p3+p4+plot_layout(ncol = 2)
+
+ggsave(file.path(outs_dir, "plots/inference_model_calibration/model_testing_estimate_boxplots_SIG14.pdf"))
+```
+
+```{r, fig.height=6, fig.width=8}
+# do any models produce more per-ligand/pair outliers than others?
+activity_out %>%
+  filter(category == "true_activity") %>%
+  ggplot(aes(x = model, y = pscore_percentile)) +
+  geom_boxplot(aes(fill = model)) +
+  ylim(0,1) +
+  scale_fill_manual(values = tab10_colors) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggtitle("Per-condition percentile rank\nof true-activity estimate")
+
+ggsave(file.path(outs_dir, "plots/inference_model_calibration/model_testing_estimate_percentile_boxplots_SIG14.pdf"))
+```
+
+```{r, fig.height=6, fig.width=12}
+# per-ligand/pair breakdown for the selected model, ordered so the
+# worst-recovered conditions (lowest percentile) surface first
+percentile_by_condition <- activity_out %>%
+  filter(model == "ridge_zscore_50_weighted", category == "true_activity") %>%
+  select(term, target_activity, interaction_cat, estimate, estimate_percentile, pscore_percentile, category) %>%
+  arrange(estimate_percentile)
+
+p1 <- percentile_by_condition %>%
+  ggplot(aes(x = reorder(term, estimate_percentile), y = estimate_percentile, fill = interaction_cat)) +
+  geom_col() +
+  coord_flip() +
+  labs(x = "condition", y = "percentile rank of true-activity estimate",
+       title = "Per-condition accuracy:\nridge_zscore_50_weighted")
+
+p2 <- percentile_by_condition %>%
+  ggplot(aes(x = reorder(term, pscore_percentile), y = pscore_percentile, fill = interaction_cat)) +
+  geom_col() +
+  coord_flip() +
+  labs(x = "condition", y = "percentile rank of true-activity pscore",
+       title = "Per-condition accuracy:\nridge_zscore_50_weighted")
+
+p1+p2
+
+ggsave(file.path(outs_dir, "plots/inference_model_calibration/model_testing_estimate_percentile_bar_SIG14.pdf"))
+```
+
+```{r, fig.height=7, fig.width=20}
+# pull out stims where corrrect estimate is not 1
+missestimates <- percentile_by_condition %>%
+  filter(estimate_percentile < 1) %>%
+  pull(target_activity)
+
+p1 <- activity_out %>%
+  filter(model == "ridge_zscore_50_weighted") %>%
+  filter(!is.na(category)) %>%
+  arrange(category == "true_activity") %>%
+  ggplot(aes(y = target_activity, x = estimate, color = category)) +
+  scale_color_manual(values = c("#1B9E77FF","grey50"),
+                     breaks = c("true_activity","other_activity")) +
+  geom_point(aes(size = -log10(padj)), alpha = 0.75) +
+  geom_vline(xintercept = 0, lty = 2, color = "red") +
+  theme(aspect.ratio = 0.75)
+
+p2 <- activity_out %>%
+  filter(model == "ridge_zscore_50_weighted") %>%
+  filter(!is.na(category)) %>%
+  arrange(category == "true_activity") %>%
+  ggplot(aes(y = term, x = estimate, color = category)) +
+  scale_color_manual(values = c("#1B9E77FF","grey50"),
+                     breaks = c("true_activity","other_activity")) +
+  geom_point(aes(size = -log10(padj)), alpha = 0.75) +
+  geom_vline(xintercept = 0, lty = 2, color = "red") +
+  theme(aspect.ratio = 0.75)
+
+p1+p2+plot_annotation("SIG14 True vs Other Activity Estimates by Activity or Stimulation")
+
+ggsave(file.path(outs_dir, "plots/inference_model_calibration/model_testing_estimates_by_stimulation_scatter_SIG14.pdf"))
+```
+
+```{r, fig.height=7, fig.width=20}
+p1 <- activity_out %>%
+  filter(model == "ridge_zscore_50_weighted") %>%
+  filter(!is.na(category)) %>%
+  mutate(label = ifelse(estimate > 2 & category == "other_activity", term, "")) %>%
+  arrange(category == "true_activity") %>%
+  ggplot(aes(y = target_activity, x = estimate, color = category)) +
+  scale_color_manual(values = c("#1B9E77FF","grey50"),
+                     breaks = c("true_activity","other_activity")) +
+  geom_point(aes(size = -log10(padj)), alpha = 0.75) +
+  geom_vline(xintercept = 0, lty = 2, color = "red") +
+  geom_text_repel(aes(label = label), size = 2) +
+  theme(aspect.ratio = 0.75)
+
+p2 <- activity_out %>%
+  filter(model == "ridge_zscore_50_weighted") %>%
+  filter(!is.na(category)) %>%
+  mutate(label = ifelse(estimate > 2 & category == "other_activity", target_activity, "")) %>%
+  arrange(category == "true_activity") %>%
+  ggplot(aes(y = term, x = estimate, color = category)) +
+  scale_color_manual(values = c("#1B9E77FF","grey50"),
+                     breaks = c("true_activity","other_activity")) +
+  geom_point(aes(size = -log10(padj)), alpha = 0.75) +
+  geom_vline(xintercept = 0, lty = 2, color = "red") +
+  geom_text_repel(aes(label = label), size = 2) +
+  theme(aspect.ratio = 0.75)
+
+p1+p2+plot_annotation("SIG14 True vs Other Activity Estimates by Activity or Stimulation")
+
+ggsave(file.path(outs_dir, "plots/inference_model_calibration/model_testing_estimates_by_stimulation_scatter_labeled_SIG14.pdf"))
+```
+
+# SIG26 Calibration Results
+
+```{r}
+activity_combined <- read_csv(file.path(imports_dir, "SIG13/analysis_outs/inference_model_calibration/activity_combined_SIG26-6h.csv"))
+```
+
+```{r}
+# define ligands in experiments and associated signaling activities in model
+mapping_tibble <- tibble(
+  stim = c(
+    'IFNG_TNF', 'IFNG_none',
+    'IL21_TNF', 'IL21_none', 'IL27_TNF', 'IL27_none', 'IL2_TNF',
+    'IL2_none', 'IL4_TNF', 'IL4_none',
+    'IL6_TNF', 'IL6_none', 'TGFB_TNF', 'TGFB_none', 'none_TNF',
+    'IL4_IL21', 'IL27_IL21',
+    'TGFB_IL4', 'TGFB_IL2'
+  ),
+  activity = c(
+    'IL27_TNF_c', 'IL27_c',
+    'IL6_TNFSF18_c', 'IL21_c', 'IL27_TNF_c', 'IL27_c', 'IL2_TNFSF18_c',
+    'IL2_c', 'IL4_TNFSF18_c', 'IL4_c',
+    'IL6_TNFSF18_c', 'IL21_c', 'TGFB1_TNFSF18_c', 'TGFB1', 'TNFSF18_c',
+    'IL4_IL21_c', 'IL27_IL21_c',
+    'TGFB1_IL4_c', 'TGFB1_IL4_c'
+  )
+)
+```
+
+```{r}
+# for each activity and model, perform linear modeling to quantify activity differences
+activity_out <- tibble()
+for(m in unique(activity_combined$model)) {
+  df <- activity_combined %>%
+    filter(model == m) %>%
+    separate_wider_delim(sample, "_", names = c("ligand1", "ligand2", "donor","well")) %>%
+    mutate(condition = factor(paste0(ligand1, "_", ligand2))) %>%
+    mutate(condition = relevel(condition, ref = "none_none"))
+  for(y_var in unique(mapping_tibble$activity)) {
+    # define pos and negative conditions
+    pos_ligands <- mapping_tibble %>%
+      filter(activity == y_var) %>%
+      pull(stim)
+    neg_ligands <- mapping_tibble %>%
+      filter(activity != y_var) %>%
+      pull(stim)
+    # run lm
+    out <- lm(as.formula(paste0(y_var, '~ condition')), df) %>%
+      broom::tidy() %>%
+      filter(grepl("condition", term)) %>%
+      mutate(term = gsub("condition", "", term)) %>%
+      mutate(
+        category = case_when(
+          term %in% pos_ligands ~ "true_activity",
+          term %in% neg_ligands ~ "other_activity"
+        ),
+        model = m,
+        target_activity = y_var
+      ) %>%
+      mutate(padj = p.adjust(p.value))
+    
+    activity_out <- bind_rows(activity_out, out)
+  }
+}
+activity_out <- activity_out %>%
+  mutate(interaction_cat = ifelse(grepl("none",term),"single","combinatorial"),
+         pscore = -log10(padj))
+```
+
+## ROC analysis
+
+```{r}
+# Calculate and visualize ROC curves by model
+activity_out %>%
+  filter(!is.na(category)) %>%
+  mutate(category = factor(category, levels = c("true_activity", "other_activity"))) %>%
+  group_by(model) %>%
+  roc_curve(category, estimate) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color = model)) +
+  geom_path(linewidth = 1) +
+  geom_abline(lty = 3, color = "grey50") +
+  scale_color_manual(values = tab10_colors) +
+  coord_equal() +
+  ggtitle("SIG26 Ridge Regression ROC")
+
+# Calculate AUC values for each model
+activity_out %>%
+  filter(!is.na(category)) %>%
+  mutate(category = factor(category, levels = c("true_activity", "other_activity"))) %>%
+  group_by(model) %>%
+  roc_auc(category, estimate)
+
+ggsave(file.path(outs_dir, "plots/inference_model_calibration/model_testing_ROC_SIG26.pdf"))
+```
+
+```{r}
+# retain SIG26 results for the joint SIG14 + SIG26 ROC comparison below
+activity_out_SIG26 <- activity_out
+```
+
+## Per-condition accuracy
+
+The ROC/AUC above pools every ligand/pair together, which can hide conditions the model fails on. Instead, for each `model x stimulation` group, rank every predicted activity estimate and ask where the true-activity condition falls: `percent_rank()` puts the highest estimate at 1, so a true-activity row near 1 means the model correctly picked that condition out from all the others tested for that activity. We also compare the raw estimate and significance of enrichment for true and false activities.
+
+```{r}
+activity_out <- activity_out %>%
+  group_by(model, term) %>%
+  mutate(estimate_percentile = percent_rank(estimate),
+         pscore_percentile = percent_rank(-log10(padj))) %>%
+  ungroup()
+```
+
+```{r, fig.height=8, fig.width=10}
+p1 <- activity_out %>%
+  filter(model == "ridge_zscore_50_weighted") %>%
+  filter(!is.na(category)) %>%
+  ggplot(aes(x = category, y = estimate)) +
+  geom_boxplot(aes(fill = interaction_cat)) +
+  theme(aspect.ratio=1)
+
+p2 <- activity_out %>%
+  filter(model == "ridge_zscore_50_weighted") %>%
+  filter(!is.na(category)) %>%
+  ggplot(aes(x = category, y = estimate)) +
+  geom_boxplot() +
+  theme(aspect.ratio=1)
+
+p3 <- activity_out %>%
+  filter(model == "ridge_zscore_50_weighted") %>%
+  filter(!is.na(category)) %>%
+  ggplot(aes(x = category, y = -log10(padj))) +
+  geom_boxplot(aes(fill = interaction_cat)) +
+  theme(aspect.ratio=1)
+
+p4 <- activity_out %>%
+  filter(model == "ridge_zscore_50_weighted") %>%
+  filter(!is.na(category)) %>%
+  ggplot(aes(x = category,  y = -log10(padj))) +
+  geom_boxplot() +
+  theme(aspect.ratio=1)
+
+p1+p2+p3+p4+plot_layout(ncol = 2)
+
+ggsave(file.path(outs_dir, "plots/inference_model_calibration/model_testing_estimate_boxplots_SIG26.pdf"))
+```
+
+```{r, fig.height=6, fig.width=8}
+# do any models produce more per-ligand/pair outliers than others?
+activity_out %>%
+  filter(category == "true_activity") %>%
+  ggplot(aes(x = model, y = estimate_percentile)) +
+  geom_boxplot(aes(fill = model)) +
+  ylim(0,1) +
+  scale_fill_manual(values = tab10_colors) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggtitle("Per-condition percentile rank\nof true-activity estimate, by model")
+
+ggsave(file.path(outs_dir, "plots/inference_model_calibration/model_testing_estimate_percentile_boxplots_SIG26.pdf"))
+```
+
+```{r, fig.height=6, fig.width=12}
+# per-ligand/pair breakdown for the selected model, ordered so the
+# worst-recovered conditions (lowest percentile) surface first
+percentile_by_condition <- activity_out %>%
+  filter(model == "ridge_zscore_50_weighted", category == "true_activity") %>%
+  select(term, target_activity, interaction_cat, estimate, estimate_percentile, pscore_percentile, category) %>%
+  arrange(estimate_percentile)
+
+p1 <- percentile_by_condition %>%
+  ggplot(aes(x = reorder(term, estimate_percentile), y = estimate_percentile, fill = interaction_cat)) +
+  geom_col() +
+  coord_flip() +
+  labs(x = "condition", y = "percentile rank of true-activity estimate",
+       title = "Per-condition accuracy:\nridge_zscore_50_weighted")
+
+p2 <- percentile_by_condition %>%
+  ggplot(aes(x = reorder(term, pscore_percentile), y = pscore_percentile, fill = interaction_cat)) +
+  geom_col() +
+  coord_flip() +
+  labs(x = "condition", y = "percentile rank of true-activity pscore",
+       title = "Per-condition accuracy:\nridge_zscore_50_weighted")
+
+p1+p2
+
+ggsave(file.path(outs_dir, "plots/inference_model_calibration/model_testing_estimate_percentile_bar_SIG26.pdf"))
+```
+
+```{r, fig.height=7, fig.width=20}
+p1 <- activity_out %>%
+  filter(model == "ridge_zscore_50_weighted") %>%
+  filter(!is.na(category)) %>%
+  arrange(category == "true_activity") %>%
+  ggplot(aes(y = target_activity, x = estimate, color = category)) +
+  scale_color_manual(values = c("#1B9E77FF","grey50"),
+                     breaks = c("true_activity","other_activity")) +
+  geom_point(aes(size = -log10(padj)), alpha = 0.75) +
+  geom_vline(xintercept = 0, lty = 2, color = "red") +
+  theme(aspect.ratio = 0.75)
+
+p2 <- activity_out %>%
+  filter(model == "ridge_zscore_50_weighted") %>%
+  filter(!is.na(category)) %>%
+  arrange(category == "true_activity") %>%
+  ggplot(aes(y = term, x = estimate, color = category)) +
+  scale_color_manual(values = c("#1B9E77FF","grey50"),
+                     breaks = c("true_activity","other_activity")) +
+  geom_point(aes(size = -log10(padj)), alpha = 0.75) +
+  geom_vline(xintercept = 0, lty = 2, color = "red") +
+  theme(aspect.ratio = 0.75)
+
+p1+p2+plot_annotation("SIG26-6h True vs Other Activity Estimates by Activity or Stimulation")
+
+ggsave(file.path(outs_dir, "plots/inference_model_calibration/model_testing_estimates_by_stimulation_scatter_SIG26.pdf"))
+```
+
+```{r, fig.height=7, fig.width=20}
+p1 <- activity_out %>%
+  filter(model == "ridge_zscore_50_weighted") %>%
+  filter(!is.na(category)) %>%
+  mutate(label = ifelse(estimate > 2 & category == "other_activity", term, "")) %>%
+  arrange(category == "true_activity") %>%
+  ggplot(aes(y = target_activity, x = estimate, color = category)) +
+  scale_color_manual(values = c("#1B9E77FF","grey50"),
+                     breaks = c("true_activity","other_activity")) +
+  geom_point(aes(size = -log10(padj)), alpha = 0.75) +
+  geom_vline(xintercept = 0, lty = 2, color = "red") +
+  geom_text_repel(aes(label = label), size = 2) +
+  theme(aspect.ratio = 0.75)
+
+p2 <- activity_out %>%
+  filter(model == "ridge_zscore_50_weighted") %>%
+  filter(!is.na(category)) %>%
+  mutate(label = ifelse(estimate > 2 & category == "other_activity", target_activity, "")) %>%
+  arrange(category == "true_activity") %>%
+  ggplot(aes(y = term, x = estimate, color = category)) +
+  scale_color_manual(values = c("#1B9E77FF","grey50"),
+                     breaks = c("true_activity","other_activity")) +
+  geom_point(aes(size = -log10(padj)), alpha = 0.75) +
+  geom_vline(xintercept = 0, lty = 2, color = "red") +
+  geom_text_repel(aes(label = label), size = 2) +
+  theme(aspect.ratio = 0.75)
+
+p1+p2+plot_annotation("SIG26-6h True vs Other Activity Estimates by Activity or Stimulation")
+
+ggsave(file.path(outs_dir, "plots/inference_model_calibration/model_testing_estimates_by_stimulation_scatter_labeled_SIG26.pdf"))
+```
+
+# SIG14 + SIG26 Joint ROC / PR
+
+Combine SIG14 and SIG26 calibration runs into a single figure per model, showing each cohort's ROC and precision-recall curves side by side, for the two best-performing ridge configurations (`ridge_zscore_50_weighted` and `ridge_zscore_50_unweighted`).
+
+```{r}
+activity_out_joint <- bind_rows(
+  activity_out_SIG14 %>% mutate(cohort = "SIG14"),
+  activity_out_SIG26 %>% mutate(cohort = "SIG26")
+)
+```
+
+```{r, fig.height=4, fig.width=5}
+# ROC by cohort: ridge_zscore_50_weighted
+df_weighted <- activity_out_joint %>%
+  filter(model == "ridge_zscore_50_weighted") %>%
+  filter(!is.na(category)) %>%
+  mutate(category = factor(category, levels = c("true_activity", "other_activity")))
+
+df_weighted %>%
+  group_by(cohort) %>%
+  roc_curve(category, estimate) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color = cohort)) +
+  geom_path(linewidth = 1) +
+  geom_abline(lty = 3, color = "grey50") +
+  scale_color_manual(values = c("#fe6100","#785ef0")) +
+  coord_equal() +
+  ggtitle("ROC ridge_zscore_50_weighted")
+
+df_weighted %>%
+  group_by(cohort) %>%
+  roc_auc(category, estimate)
+
+ggsave(file.path(outs_dir, "plots/inference_model_calibration/model_testing_ROC_joint_SIG14_SIG26_weighted.pdf"))
+```
+
+```{r, fig.height=4, fig.width=5}
+# ROC + PR by cohort: ridge_zscore_50_unweighted
+df_unweighted <- activity_out_joint %>%
+  filter(model == "ridge_zscore_50_unweighted") %>%
+  filter(!is.na(category)) %>%
+  mutate(category = factor(category, levels = c("true_activity", "other_activity")))
+
+df_unweighted %>%
+  group_by(cohort) %>%
+  roc_curve(category, estimate) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color = cohort)) +
+  geom_path(linewidth = 1) +
+  geom_abline(lty = 3, color = "grey50") +
+  scale_color_manual(values = c("#fe6100","#785ef0")) +
+  coord_equal() +
+  ggtitle("ROC ridge_zscore_50_unweighted")
+
+df_unweighted %>%
+  group_by(cohort) %>%
+  roc_auc(category, estimate)
+
+ggsave(file.path(outs_dir, "plots/inference_model_calibration/model_testing_ROC_joint_SIG14_SIG26_unweighted.pdf"))
+```
+
+## ROC by single vs combinatorial activity
+
+Facet the joint ROC curves by `interaction_cat` (single vs combinatorial) and `cohort` (SIG14 vs SIG26) to see whether either model's discrimination is driven by single-ligand conditions vs combinatorial pairs.
+
+```{r, fig.height=6, fig.width=6}
+# ROC faceted by interaction_cat x cohort: ridge_zscore_50_weighted
+df_weighted %>%
+  mutate(cohort_interaction = paste0(cohort,"_",interaction_cat)) %>%
+  group_by(cohort_interaction) %>%
+  roc_curve(category, estimate) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color = cohort_interaction)) +
+  geom_path(linewidth = 1) +
+  geom_abline(lty = 3, color = "grey50") +
+  scale_color_manual(values = c("#fdbf6f","#ff7f00","#cab2d6","#6a3d9a")) +
+  coord_equal() +
+  ggtitle("ROC ridge_zscore_50_weighted\nby single vs combinatorial activity")
+
+df_weighted %>%
+  group_by(cohort, interaction_cat) %>%
+  roc_auc(category, estimate)
+
+ggsave(file.path(outs_dir, "plots/inference_model_calibration/model_testing_ROC_joint_SIG14_SIG26_weighted_facet_interaction.pdf"))
+```
+
+```{r, fig.height=6, fig.width=6}
+# ROC faceted by interaction_cat x cohort: ridge_zscore_50_unweighted
+df_unweighted %>%
+  mutate(cohort_interaction = paste0(cohort,"_",interaction_cat)) %>%
+  group_by(cohort_interaction) %>%
+  roc_curve(category, estimate) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color = cohort_interaction)) +
+  geom_path(linewidth = 1) +
+  geom_abline(lty = 3, color = "grey50") +
+  scale_color_manual(values = c("#fdbf6f","#ff7f00","#cab2d6","#6a3d9a")) +
+  coord_equal() +
+  ggtitle("ROC ridge_zscore_50_unweighted\nby single vs combinatorial activity")
+
+df_unweighted %>%
+  group_by(cohort, interaction_cat) %>%
+  roc_auc(category, estimate)
+
+ggsave(file.path(outs_dir, "plots/inference_model_calibration/model_testing_ROC_joint_SIG14_SIG26_unweighted_facet_interaction.pdf"))
+```
+
+
+
+
+
+
+
+
+

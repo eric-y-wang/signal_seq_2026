@@ -1,0 +1,493 @@
+---
+title: "Th receptor cross-regulation"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup}
+library(tidyverse)
+library(pheatmap)
+library(RColorBrewer)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# Repo-relative paths: inputs from imports_stable/, outputs to analysis_outs/<module>/
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "07_crispr_arrayed_validation_RNAseq_SIG30")
+dir.create(file.path(outs_dir, "program_crossreg"), recursive = TRUE, showWarnings = FALSE)
+source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
+theme_set(theme_Publication())
+```
+
+# Import
+
+```{r}
+deg_SIG14 <- read_csv(file.path(imports_dir, "SIG14/analysis_outs/deg_updated/res_conditions_SIG14.csv"))
+deg_SIG18 <- read_csv(file.path(imports_dir, "SIG18/analysis_outs/deg/res_conditions_SIG18.csv"))
+deg_SIG30_targets <- read_csv(file.path(imports_dir, "SIG30/analysis_outs/res_targets_SIG30.csv"))
+int_SIG18 <- read_csv(file.path(imports_dir, "SIG18/analysis_outs/deg/res_interaction_scored_SIG18.csv"))
+deg_SIG29 <- read_csv(file.path(imports_dir, "SIG29/analysis_outs/res_conditions_SIG29.csv"))
+int_SIG29 <- read_csv(file.path(imports_dir, "SIG29/analysis_outs/res_interaction_scored_SIG29.csv"))
+```
+
+```{r}
+deg_SIG18 <- deg_SIG18 %>%
+  mutate(condition = case_match(condition,
+                                 "Th2"  ~ "IL4",
+                                 "Th1" ~ "IFNg",
+                                 "TGFb" ~ "TGFb",
+                                 "TNF" ~ "TNF",
+                                 "Th2-TNF" ~ "IL4-TNF",
+                                 "Th1-TNF" ~ "IFNg-TNF",
+                                 "TGFb-TNF" ~ "TGFb-TNF",
+                                 "iTreg" ~ "TGFb-IL2",
+                                 "iTreg-TNF" ~ "TGFb-TNF-IL2",
+                                  .default = condition)) %>%
+  mutate(timepoint = "96hours")
+
+deg_SIG14 <- deg_SIG14  %>%
+  mutate(timepoint = "6hours")
+
+# Single-ligand conditions only; combination conditions (e.g. TGFb-TNF) are
+# handled separately below alongside the SIG30 CRISPR perturbations.
+deg_joint <- bind_rows(deg_SIG18, deg_SIG14) %>%
+  filter(condition %in% c("IL4","IFNg","TGFb","TNF"))
+```
+
+SIG29 is the ligand experiment run in the same sequencing batch as SIG30
+(TGFb x {TNF, TL1A, OX40L, DTA1}). Its conditions are coded `ligand1_ligand2`
+with `none` placeholders; recode them to the `TGFb-TNF` style used above.
+
+```{r}
+clean_SIG29_condition <- function(x) {
+  x %>%
+    str_remove("^none_") %>%
+    str_remove("_none$") %>%
+    str_replace("_", "-")
+}
+
+deg_SIG29 <- deg_SIG29 %>%
+  mutate(condition = clean_SIG29_condition(condition))
+
+int_SIG29 <- int_SIG29 %>%
+  mutate(condition = clean_SIG29_condition(condition))
+```
+
+# Helper functions
+
+Shared helpers for pivoting long DEG tables into gene x condition LFC/padj
+matrices and rendering them as annotated heatmaps.
+
+```{r}
+# --- Pivot a long (gene, condition, log2FoldChange, padj) df into matrices ---
+build_lfc_padj_mats <- function(df, genes, conditions) {
+  df <- df %>% filter(gene %in% genes, condition %in% conditions)
+
+  pivot_mat <- function(value_col) {
+    mat <- df %>%
+      pivot_wider(id_cols = "gene", names_from = "condition",
+                  values_from = all_of(value_col), values_fill = NaN) %>%
+      right_join(tibble(gene = genes), by = "gene") %>%
+      column_to_rownames("gene") %>%
+      as.matrix()
+
+    for (cn in setdiff(conditions, colnames(mat))) mat[, cn] <- NA
+    mat[genes, conditions, drop = FALSE]
+  }
+
+  list(lfc = pivot_mat("log2FoldChange"), padj = pivot_mat("padj"))
+}
+
+# --- Convert a padj matrix into a matrix of significance stars ---
+stars_from_padj <- function(p) {
+  p_vec <- as.vector(p)
+  stars_vec <- case_when(
+    is.na(p_vec)  ~ "",
+    p_vec < 0.001 ~ "***",
+    p_vec < 0.01  ~ "**",
+    p_vec < 0.05  ~ "*",
+    TRUE          ~ ""
+  )
+  matrix(stars_vec, nrow = nrow(p), ncol = ncol(p), dimnames = dimnames(p))
+}
+
+lfc_color_scale <- colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100)
+```
+
+# Map Receptor Induction
+
+For each receptor panel, keep genes significant (`padj < 0.1`) in at least
+one ligand/timepoint, then plot LFC across all ligand conditions at both
+6h and 96h (using the unfiltered LFC so nonsignificant values are retained,
+with significance stars overlaid).
+
+```{r, fig.height=3.5, fig.width=4}
+ligands <- c("IFNg","IL4","TGFb","TNF","IL6","IL21","IL12","IL2")
+receptors <- c("Ifngr1","Il12rb1","Il2ra","Il2rb","Il4ra","Il6ra","Il21r",
+               "Tnfrsf1b","Tgfbr2","Tnfrsf25","Tnfrsf4","Tnfrsf18")
+
+deg_df <- deg_SIG14 %>%
+  filter(condition %in% ligands)
+
+genes <- deg_df %>%
+  filter(gene %in% receptors, padj < 0.1) %>%
+  distinct(gene) %>%
+  pull(gene) %>%
+  sort()
+
+conditions <- deg_df %>%
+  filter(gene %in% genes) %>%
+  distinct(condition) %>%
+  pull(condition) %>%
+  sort()
+
+m_6h  <- build_lfc_padj_mats(filter(deg_df, timepoint == "6hours"), genes, conditions)
+
+colnames(m_6h$lfc)  <- colnames(m_6h$padj)  <- paste0(conditions, "_6h")
+
+mat   <- cbind(m_6h$lfc)
+stars <- cbind(stars_from_padj(m_6h$padj))
+
+col_anno <- data.frame(timepoint = rep(c("6hours"), each = length(conditions)),
+                       row.names = colnames(mat))
+
+hm <- pheatmap(
+  mat,
+  cluster_cols = T,
+  cluster_rows = F,
+  annotation_col = col_anno,
+  labels_col = sub("_6h$|_96h$", "", colnames(mat)),
+  color = lfc_color_scale,
+  breaks = seq(-2, 2, length.out = 101),
+  na_col = "grey90",
+  display_numbers = stars,
+  fontsize_number = 12,
+  number_color = "black"
+)
+
+save_pheatmap_pdf(hm, file.path(outs_dir, "program_crossreg/crossreg_6h_all.pdf"), height = 3.5, width = 4)
+```
+
+```{r, fig.height=2.5, fig.width=4.5}
+ligands <- c("IFNg","IL12","IL2","IL4","IL6","IL21","TNF","TGFb")
+receptors <- c("Ifngr1","Il12rb1","Il2ra","Il2rb","Il4ra","Il6ra","Il21r",
+               "Tnfrsf1b","Tgfbr2")
+
+deg_df <- deg_SIG14 %>%
+  filter(condition %in% ligands)
+
+genes <- deg_df %>%
+  filter(gene %in% receptors, padj < 0.1) %>%
+  distinct(gene) %>%
+  pull(gene) %>%
+  sort()
+
+conditions <- deg_df %>%
+  filter(gene %in% genes) %>%
+  distinct(condition) %>%
+  pull(condition) %>%
+  sort()
+
+m_6h  <- build_lfc_padj_mats(filter(deg_df, timepoint == "6hours"), genes, conditions)
+
+colnames(m_6h$lfc)  <- colnames(m_6h$padj)
+
+mat   <- cbind(m_6h$lfc)
+mat   <- mat[receptors ,ligands]
+stars <- cbind(stars_from_padj(m_6h$padj))
+stars <- stars[receptors ,ligands]
+
+col_anno <- data.frame(timepoint = rep(c("6hours"), each = length(conditions)),
+                       row.names = colnames(mat))
+
+hm <- pheatmap(
+  mat,
+  cluster_cols = F,
+  cluster_rows = F,
+  annotation_col = col_anno,
+  labels_col = sub("_6h$|_96h$", "", colnames(mat)),
+  color = lfc_color_scale,
+  breaks = seq(-2, 2, length.out = 101),
+  na_col = "grey90",
+  display_numbers = stars,
+  fontsize_number = 12,
+  angle_col = 90,
+  number_color = "black"
+)
+
+save_pheatmap_pdf(hm, file.path(outs_dir, "program_crossreg/crossreg_6h_subset.pdf"), height = 2.5, width = 4.5)
+```
+
+```{r}
+plot_receptor_heatmap_joint <- function(deg_df, receptors, sig_thresh = 0.1, lfc_limit = 3) {
+  genes <- deg_df %>%
+    filter(gene %in% receptors, padj < sig_thresh) %>%
+    distinct(gene) %>%
+    pull(gene) %>%
+    sort()
+
+  conditions <- deg_df %>%
+    filter(gene %in% genes) %>%
+    distinct(condition) %>%
+    pull(condition) %>%
+    sort()
+
+  m_6h  <- build_lfc_padj_mats(filter(deg_df, timepoint == "6hours"),  genes, conditions)
+  m_96h <- build_lfc_padj_mats(filter(deg_df, timepoint == "96hours"), genes, conditions)
+
+  colnames(m_6h$lfc)  <- colnames(m_6h$padj)  <- paste0(conditions, "_6h")
+  colnames(m_96h$lfc) <- colnames(m_96h$padj) <- paste0(conditions, "_96h")
+
+  mat   <- cbind(m_6h$lfc, m_96h$lfc)
+  stars <- cbind(stars_from_padj(m_6h$padj), stars_from_padj(m_96h$padj))
+
+  col_anno <- data.frame(
+    timepoint = rep(c("6hours", "96hours"), each = length(conditions)),
+    row.names = colnames(mat)
+  )
+
+  pheatmap(mat,
+           cluster_cols = FALSE,
+           cluster_rows = FALSE,
+           gaps_col = length(conditions),
+           annotation_col = col_anno,
+           labels_col = sub("_6h$|_96h$", "", colnames(mat)),
+           color = lfc_color_scale,
+           breaks = seq(-lfc_limit, lfc_limit, length.out = 101),
+           na_col = "grey90",
+           display_numbers = stars,
+           fontsize_number = 12,
+           number_color = "black")
+}
+```
+
+
+```{r, fig.height=3, fig.width=4.5}
+plot_receptor_heatmap_joint(deg_joint, c("Il12rb1","Il4ra","Il2ra","Il2rb","Il6ra","Ifngr1",
+                                    "Tnfrsf1b","Tnfrsf25","Tgfbr2","Tnfrsf4","Tnfrsf18"))
+```
+
+```{r, fig.height=2.5, fig.width=4}
+plot_receptor_heatmap_joint(deg_joint, c("Il12rb1","Il4ra","Il2ra","Il2rb","Il6ra","Tnfrsf1b","Tgfbr2"))
+```
+
+# Ligand induction vs. CRISPR perturbation
+
+`Tgfbr2`, `Tnfrsf1b`, `Nr4a3`, and `Ptpn1` are both ligand-regulated
+receptors/signaling genes (in the SIG29 ligand panel) and direct CRISPR
+KO targets in this screen (SIG30). Ligand-induced changes are taken from
+SIG29, the TGFb x costimulatory-ligand experiment run in the same sequencing
+batch as SIG30. This compares each gene's TGFb x TNF *interaction* term
+(deviation of the combo from the additive expectation, `lfc_interaction` /
+`padj_interaction` from SIG29) against its LFC under CRISPR knockout of each
+of the 9 SIG30 targets (vs. control), so cross-regulation between targets
+(not just self-knockout) is visible.
+
+```{r, fig.height=3, fig.width=7}
+crispr_genes <- c("Stat5b", "Stat5a", "Il2ra","Il2rb","Tgfbr1", "Tgfbr2", "Ptpn1","Nr4a3","Tnfrsf1b")
+order <- c("TNF","TGFb","TGFb-TNF","TGFb:TNF","Stat5b", "Stat5a", "Il2ra", "Tgfbr2","Tnfrsf1b", "Ptpn1","Nr4a3")
+
+# TGFb+TNF shown as the interaction term, not the overall combo estimate
+int_lfc <- int_SIG29 %>%
+  filter(gene %in% crispr_genes, condition == "TGFb-TNF") %>%
+  transmute(gene,
+            condition = "TGFb:TNF",
+            log2FoldChange = lfc_interaction,
+            padj = padj_interaction)
+
+deg_lfc <- deg_SIG29 %>%
+  filter(gene %in% crispr_genes, condition %in% c("TNF","TGFb","TGFb-TNF"))%>%
+  transmute(gene,
+            condition = condition,
+            log2FoldChange = log2FoldChange,
+            padj = padj)
+
+crispr_targets <- sort(unique(deg_SIG30_targets$target))
+
+crispr_lfc <- deg_SIG30_targets %>%
+  filter(gene %in% crispr_genes) %>%
+  rename(condition = target)
+
+conditions <- c(deg_lfc$condition %>% unique(), "TGFb:TNF", crispr_targets)
+
+mats <- build_lfc_padj_mats(bind_rows(deg_lfc, int_lfc, crispr_lfc), crispr_genes, conditions)
+mats$lfc <- mats$lfc[,order]
+mats$padj <- mats$padj[,order]
+
+col_anno <- data.frame(
+  perturbation = c(rep("SIG29", length(deg_lfc$condition %>% unique())),
+                   "TGFb x TNF interaction",
+                   rep("CRISPR KO", length(crispr_targets))),
+  row.names = conditions
+)
+
+hm <- pheatmap(mats$lfc,
+         cluster_cols = FALSE,
+         cluster_rows = T,
+         gaps_col = c(3,4),
+         annotation_col = col_anno,
+         color = lfc_color_scale,
+         breaks = seq(-2, 2, length.out = 101),
+         na_col = "grey90",
+         display_numbers = stars_from_padj(mats$padj),
+         fontsize_number = 12,
+         number_color = "black",
+         angle_col = 90)
+save_pheatmap_pdf(hm, file.path(outs_dir, "program_crossreg/crossreg_hm_crispr_perturbations_all_SIG29.pdf"), width=7, height = 3)
+```
+
+```{r, fig.height=3, fig.width=8}
+crispr_genes <- c("Stat5b", "Stat5a", "Il2ra","Il2rb","Tgfbr1", "Tgfbr2", "Ptpn1","Nr4a3","Tnfrsf1b")
+ligand_conditions <- c("TGFb","TNF","TGFb-TNF","TL1A","TGFb-TL1A",
+                       "OX40L","TGFb-OX40L","DTA1","TGFb-DTA1")
+order <- c(ligand_conditions,
+           "Stat5b", "Stat5a", "Il2ra", "Tgfbr2","Tnfrsf1b", "Ptpn1","Nr4a3")
+
+deg_lfc <- deg_SIG29 %>%
+  filter(gene %in% crispr_genes, condition %in% ligand_conditions)%>%
+  transmute(gene,
+            condition = condition,
+            log2FoldChange = log2FoldChange,
+            padj = padj)
+
+crispr_targets <- sort(unique(deg_SIG30_targets$target))
+
+crispr_lfc <- deg_SIG30_targets %>%
+  filter(gene %in% crispr_genes) %>%
+  rename(condition = target)
+
+conditions <- c(deg_lfc$condition %>% unique(), crispr_targets)
+
+mats <- build_lfc_padj_mats(bind_rows(deg_lfc, crispr_lfc), crispr_genes, conditions)
+mats$lfc <- mats$lfc[,order]
+mats$padj <- mats$padj[,order]
+
+col_anno <- data.frame(
+  cat = c(rep("SIG29 LFC", length(deg_lfc$condition %>% unique())),
+                   rep("CRISPR KO LFC", length(crispr_targets))),
+  row.names = conditions
+)
+
+hm <- pheatmap(mats$lfc,
+         cluster_cols = FALSE,
+         cluster_rows = T,
+         gaps_col = length(ligand_conditions),
+         annotation_col = col_anno,
+         color = lfc_color_scale,
+         breaks = seq(-2, 2, length.out = 101),
+         na_col = "grey90",
+         display_numbers = stars_from_padj(mats$padj),
+         fontsize_number = 12,
+         number_color = "black",
+         angle_col = 90)
+save_pheatmap_pdf(hm, file.path(outs_dir, "program_crossreg/crossreg_hm_crispr_perturbations_SIG29_ligand_panel.pdf"), width=8, height = 3)
+```
+
+```{r, fig.height=3, fig.width=6}
+crispr_genes <- c("Stat5b", "Stat5a", "Il2ra","Il2rb","Tgfbr1", "Tgfbr2", "Ptpn1","Nr4a3","Tnfrsf1b")
+order <- c("IL2","TNF","TGFb","IL2-TNF","Stat5b", "Stat5a", "Il2ra", "Tgfbr2","Tnfrsf1b", "Ptpn1","Nr4a3")
+
+deg_lfc <- deg_SIG14 %>%
+  filter(gene %in% crispr_genes, condition %in% c("TNF","IL2","TGFb","IL2-TNF"))%>%
+  transmute(gene,
+            condition = condition,
+            log2FoldChange = log2FoldChange,
+            padj = padj)
+
+crispr_targets <- sort(unique(deg_SIG30_targets$target))
+
+crispr_lfc <- deg_SIG30_targets %>%
+  filter(gene %in% crispr_genes) %>%
+  rename(condition = target)
+
+conditions <- c(deg_lfc$condition %>% unique(), crispr_targets)
+
+mats <- build_lfc_padj_mats(bind_rows(deg_lfc, crispr_lfc), crispr_genes, conditions)
+mats$lfc <- mats$lfc[,order]
+mats$padj <- mats$padj[,order]
+
+col_anno <- data.frame(
+  cat = c(rep("SIG14 LFC", length(deg_lfc$condition %>% unique())),
+                   rep("CRISPR KO LFC", length(crispr_targets))),
+  row.names = conditions
+)
+
+hm <- pheatmap(mats$lfc,
+         cluster_cols = FALSE,
+         cluster_rows = F,
+         gaps_col = 3,
+         annotation_col = col_anno,
+         color = lfc_color_scale,
+         breaks = seq(-2, 2, length.out = 101),
+         na_col = "grey90",
+         display_numbers = stars_from_padj(mats$padj),
+         fontsize_number = 12,
+         number_color = "black",
+         angle_col = 90)
+save_pheatmap_pdf(hm, file.path(outs_dir, "program_crossreg/crossreg_hm_crispr_perturbations_SIG14_Tgfb_Tnf_single.pdf"), width=6, height = 3)
+```
+
+```{r, fig.height=2.5, fig.width=8}
+crispr_genes <- int_SIG29$gene[grepl("^Ptpn|^Nr4a", int_SIG29$gene)] %>% unique() %>% sort()
+order <- c("TNF","TGFb","TGFb-TNF","TGFb:TNF","Stat5b", "Stat5a", "Il2ra", "Tgfbr2","Tnfrsf1b", "Ptpn1","Nr4a3")
+# TGFb+TNF shown as the interaction term, not the overall combo estimate
+int_lfc <- int_SIG29 %>%
+  filter(gene %in% crispr_genes, condition == "TGFb-TNF") %>%
+  transmute(gene,
+            condition = "TGFb:TNF",
+            log2FoldChange = lfc_interaction,
+            padj = padj_interaction)
+deg_lfc <- deg_SIG29 %>%
+  filter(gene %in% crispr_genes, condition %in% c("TNF","TGFb","TGFb-TNF"))%>%
+  transmute(gene,
+            condition = condition,
+            log2FoldChange = log2FoldChange,
+            padj = padj)
+crispr_targets <- sort(unique(deg_SIG30_targets$target))
+crispr_lfc <- deg_SIG30_targets %>%
+  filter(gene %in% crispr_genes) %>%
+  rename(condition = target)
+conditions <- c(deg_lfc$condition %>% unique(), "TGFb:TNF", crispr_targets)
+mats <- build_lfc_padj_mats(bind_rows(deg_lfc, int_lfc, crispr_lfc), crispr_genes, conditions)
+mats$lfc <- mats$lfc[,order]
+mats$padj <- mats$padj[,order]
+
+# Transpose so conditions become rows and genes become columns
+mats$lfc <- t(mats$lfc)
+mats$padj <- t(mats$padj)
+
+row_anno <- data.frame(
+  cat = c(rep("SIG29 overall LFC", length(deg_lfc$condition %>% unique())),
+                   "TGFb x TNF interaction coeff",
+                   rep("CRISPR KO LFC", length(crispr_targets))),
+  row.names = conditions
+)
+hm <- pheatmap(mats$lfc,
+         cluster_cols = FALSE,
+         cluster_rows = F,
+         gaps_row = c(3,4),
+         annotation_row = row_anno,
+         color = lfc_color_scale,
+         breaks = seq(-2, 2, length.out = 101),
+         na_col = "grey90",
+         display_numbers = stars_from_padj(mats$padj),
+         fontsize_number = 12,
+         number_color = "black",
+         angle_col = 90)
+save_pheatmap_pdf(hm, file.path(outs_dir, "program_crossreg/crossreg_hm_nr4a_ptpn_family_SIG29.pdf"), width=8, height = 2.5)
+```
+
+
+
+
+

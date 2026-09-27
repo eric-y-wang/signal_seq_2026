@@ -1,0 +1,222 @@
+---
+title: "Ligand Activity Figures: Thomas IBD"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE)
+source("viz_helpers.R")
+```
+
+# Import
+
+Regression results from `06_regressions_thomas_ibd.Rmd`.
+
+```{r}
+res_disease <- read_csv(file.path(RES_IN_DIR, "thomas_ibd_disease_pre.csv"),
+                        show_col_types = FALSE)
+res_disease_remission <- read_csv(file.path(RES_IN_DIR, "thomas_ibd_disease_remission_pre.csv"),
+                                  show_col_types = FALSE)
+res_celltype <- read_csv(file.path(RES_IN_DIR, "thomas_ibd_celltype_pre.csv"),
+                         show_col_types = FALSE)
+res_disease_celltype <- read_csv(file.path(RES_IN_DIR, "thomas_ibd_disease_celltype_pre.csv"),
+                                 show_col_types = FALSE)
+res_disease_celltype_remission <- read_csv(
+  file.path(RES_IN_DIR, "thomas_ibd_disease_celltype_remission_pre.csv"), show_col_types = FALSE)
+
+# "<disease>_<remission>_<timepoint> - Healthy_None_None" -> three columns.
+# Non_Remission is hyphenated first so the split on "_" gives three fields.
+split_vs_healthy <- function(res) {
+  res %>%
+    mutate(contrast = str_remove(contrast, " - Healthy_None_None"),
+           contrast = str_replace(contrast, "Non_Remission", "Non-Remission")) %>%
+    separate_wider_delim(contrast, delim = "_",
+                         names = c("Disease", "Remission", "Timepoint"))
+}
+res_vs_healthy <- read_csv(file.path(RES_IN_DIR, "thomas_ibd_disease_treatment_vsHealthy.csv"),
+                           show_col_types = FALSE) %>% split_vs_healthy()
+res_vs_healthy_celltype <- read_csv(
+  file.path(RES_IN_DIR, "thomas_ibd_disease_treatment_vsHealthy_celltype.csv"),
+  show_col_types = FALSE) %>% split_vs_healthy()
+```
+
+# Model fit
+
+```{r, fig.height=9, fig.width=9}
+(plot_model_fit("thomas_ibd", "whole sample") + plot_model_fit("thomas_ibd_celltype", "per celltype")) /
+  (plot_alpha_fit("thomas_ibd", "whole sample") + plot_alpha_fit("thomas_ibd_celltype", "per celltype"))
+```
+
+# Disease associations
+
+```{r, fig.height=8, fig.width=12}
+plot_volcano(res_disease, facet = "contrast", label = FALSE,
+             title = "Pre-treatment disease contrasts") /
+  plot_volcano(res_disease, facet = "contrast",
+               title = "Pre-treatment disease contrasts (labelled)")
+
+save_plot("ibd_disease_volcano")
+```
+
+## By celltype
+
+```{r, fig.height=6, fig.width=5}
+res_disease_celltype %>%
+  filter(contrast != "CD - UC") %>%
+  plot_significance_grid(title = "Activities differing from healthy")
+
+save_plot("ibd_disease_celltype_significance_grid")
+```
+
+```{r}
+# per-celltype activity heatmap, showing the n most significant activities in that
+# celltype together with their constituent single-ligand activities
+plot_celltype_activities <- function(res, target, n_top = 10) {
+  activities <- top_activities(res, n = n_top, within = tibble(celltype = target)) %>%
+    with_component_singles()
+
+  res %>%
+    filter(celltype == target) %>%
+    mutate(contrast = str_replace_all(contrast, " - ", "_")) %>%
+    plot_activity_tiles(activities, title = paste(target, "activity contrasts"))
+}
+```
+
+```{r, fig.height=20, fig.width=20}
+responding_celltypes <- res_disease_celltype %>%
+  filter(contrast != "CD - UC", padj < SIG_CUTOFF) %>%
+  distinct(celltype) %>%
+  pull(celltype)
+
+map(responding_celltypes, ~ plot_celltype_activities(res_disease_celltype, .x)) %>%
+  wrap_plots(ncol = 3)
+```
+
+```{r, fig.height=12, fig.width=6}
+plot_celltype_activities(res_disease_celltype, "CD4 HSPhi CD70pos Treg", n_top = 5) /
+  plot_celltype_activities(res_disease_celltype, "Th1", n_top = 5) /
+  plot_celltype_activities(res_disease_celltype, "Th1 17 GZMAhi", n_top = 6)
+
+save_plot("ibd_Th1_Th17_pretreatment_disease")
+```
+
+# Remission
+
+Baseline (pre-treatment) differences between patients who later did or did not
+enter remission. Estimates are inverted so positive means *higher in
+non-remission*.
+
+```{r, fig.height=5, fig.width=8}
+non_vs_remission <- function(res) {
+  res %>%
+    filter(contrast %in% c("UC_Remission - UC_Non_Remission",
+                           "CD_Remission - CD_Non_Remission")) %>%
+    mutate(contrast = str_extract(contrast, "^(UC|CD)"),
+           estimate = -estimate)
+}
+
+plot_volcano(non_vs_remission(res_disease_remission), facet = "contrast", ymax = 3,
+             title = "Non-remission vs remission, pre-treatment")
+
+save_plot("ibd_pretreatment_non_vs_remission_volcano")
+```
+
+```{r, fig.height=3.5, fig.width=4}
+non_vs_remission(res_disease_celltype_remission) %>%
+  filter(estimate > 0) %>%
+  plot_significance_grid(title = "Activities raised pre-treatment\nin non-remission")
+
+save_plot("ibd_celltype_non_vs_remission_grid", width = 4, height = 3.5)
+```
+
+```{r, fig.height=4, fig.width=16}
+celltype_remission <- non_vs_remission(res_disease_celltype_remission)
+
+pmap(list(disease = c("UC", "UC", "UC", "CD"),
+          target = c("Th1 17 GZMApos", "CD4 KLF2int T", "CD4 TNFSF13Bhi T","Tph Tfh"),
+          ymax = c(3, 3, 3, 3)),
+     function(disease, target, ymax) {
+       celltype_remission %>%
+         filter(contrast == disease, celltype == target) %>%
+         plot_volcano(ymax = ymax, title = paste(disease, target))
+     }) %>%
+  wrap_plots(ncol = 4)
+
+save_plot("ibd_celltype_non_vs_remission")
+```
+
+# Treatment
+
+Every disease x remission x timepoint group against healthy controls.
+
+```{r, fig.height=8, fig.width=10}
+GROUP_LEVELS <- c("CD_Remission_Pre", "CD_Remission_Post",
+                  "CD_Non-Remission_Pre", "CD_Non-Remission_Post",
+                  "UC_Remission_Pre", "UC_Remission_Post",
+                  "UC_Non-Remission_Pre", "UC_Non-Remission_Post")
+
+label_groups <- function(res) {
+  mutate(res, group = factor(paste(Disease, Remission, Timepoint, sep = "_"),
+                             GROUP_LEVELS))
+}
+
+res_vs_healthy %>%
+  label_groups() %>%
+  filter(Timepoint == "Pre") %>%
+  plot_volcano(facet = "group", title = "Pre-treatment vs healthy")
+
+save_plot("ibd_pretreatment_vs_healthy_volcano")
+```
+
+Activities elevated pre-treatment, tracked across treatment: if an activity drops
+after treatment in the patients who remit but not in those who do not, it is a
+candidate readout of response.
+
+```{r, fig.height=6, fig.width=18}
+plot_elevated_activities <- function(target_disease, n_top = 100) {
+  df <- res_vs_healthy %>% label_groups() %>% filter(Disease == target_disease)
+
+  elevated <- df %>%
+    filter(estimate > 0, padj < SIG_CUTOFF) %>%
+    group_by(component) %>%
+    slice_max(estimate, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    slice_max(estimate, n = n_top) %>%
+    pull(component) %>%
+    with_component_singles()
+
+  # order activities by their pre-treatment estimate in the remission arm
+  order_by <- df %>%
+    filter(group == paste0(target_disease, "_Remission_Pre")) %>%
+    annotate_results() %>%
+    arrange(desc(estimate)) %>%
+    pull(name)
+
+  plot_activity_ranges(df, elevated, group = "group",
+                       order_by = order_by,
+                       title = paste(target_disease, "activities elevated pre-treatment")) +
+    scale_fill_manual(values = c("#33A02C", "#B2DF8A", "#E31A1C", "#FB9A99")) +
+    scale_color_manual(values = c("#33A02C", "#B2DF8A", "#E31A1C", "#FB9A99"))
+}
+
+(plot_elevated_activities("CD") + theme(legend.position = "none")) +
+  plot_elevated_activities("UC") +
+  plot_layout(widths = c(2, 1.5))
+
+save_plot("ibd_pretreatment_elevated_ranges", width = 18, height = 6)
+```
+
+# Celltype identity
+
+```{r, fig.height=10, fig.width=12}
+plot_activity_tiles(res_celltype,
+                    activities = top_activities(res_celltype, n = 20),
+                    title = "Celltype-distinguishing activities (deleted-effect contrasts)")
+
+save_plot("ibd_celltype_tiles")
+```

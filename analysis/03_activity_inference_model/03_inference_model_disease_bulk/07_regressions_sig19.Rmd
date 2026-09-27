@@ -1,0 +1,202 @@
+---
+title: "Ligand Activity Regressions: SIG19 (Treg depletion + cytokine blockade)"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE)
+source("regression_helpers.R")
+```
+
+# Goal
+
+Test which SIG13 ligand activities respond to in vivo antibody treatment in SIG19
+inguinal lymph node CD4 T cells, using the activity scores from
+`02_score_disease_datasets.py`.
+
+Treatment groups pair a Treg-perturbing antibody with a cytokine blockade:
+
+| group       | stimulation  |
+|-------------|--------------|
+| `isotype`   | control      |
+| `DTA1`      | TNF.         |
+| `GK1.5-IL4` | IL4.         |
+| `GK1.5-BGo` | TGF-beta     |
+| `DTA1-IL4`  | TNF + IL4    |
+| `DTA1-BGo`  | TNF + TGF-b  |
+
+This 2x2 layout supports a **synergy** test per combination: is the double
+treatment more than the sum of its single arms,
+`(DTA1-IL4 - GK1.5-IL4) - (DTA1 - isotype)`?
+
+**Covariate: `sex`.** Cage is the other candidate -- it is the shared-housing unit,
+and it is not aliased with treatment (each cage holds 3-4 treatment groups, each
+treatment spans 3-5 cages) -- but with only 23 mice it costs 4 more residual df
+(12 vs 16) for very little change in the estimates themselves (r = 0.97 between the
+two models' estimates, SEs 1.09x).
+
+**Multiple testing: emmeans' own adjustment**, i.e. across the contrast family within
+each activity -- Dunnett for the vs-isotype comparisons, Tukey for the pairwise ones.
+
+# Import
+
+```{r}
+SIG19_KEYS <- c("treatment", "mouse", "cage", "sex")
+TREATMENTS <- c("isotype", "DTA1", "GK1.5-IL4", "GK1.5-BGo", "DTA1-IL4", "DTA1-BGo")
+
+sig19 <- load_activity_scores("sig19_iln", SIG19_KEYS) %>%
+  mutate(treatment = factor(treatment, TREATMENTS), cage = factor(cage), sex = factor(sex))
+
+sig19_celltype <- load_activity_scores("sig19_iln_celltype", c(SIG19_KEYS, "leiden_0.5")) %>%
+  rename(leiden = `leiden_0.5`) %>%
+  mutate(treatment = factor(treatment, TREATMENTS),
+         cage = factor(cage), sex = factor(sex),
+         celltype = factor(paste0("cluster_", leiden)))
+
+activities <- activity_names()
+cat(nrow(sig19), "mice,", length(activities), "ligand activities\n")
+count(sig19, treatment, sex)
+```
+
+```{r}
+# synergy contrasts, in the order emmeans reports the treatment levels
+levs <- levels(sig19$treatment)
+synergy_contrasts <- list(
+  "DTA1-IL4-synergy" = synergy_contrast(levs, both = "DTA1-IL4",
+                                        single_a = "GK1.5-IL4", single_b = "DTA1",
+                                        control = "isotype"),
+  "DTA1-BGo-synergy" = synergy_contrast(levs, both = "DTA1-BGo",
+                                        single_a = "GK1.5-BGo", single_b = "DTA1",
+                                        control = "isotype")
+)
+```
+
+# Treatment associations
+
+## Each treatment vs isotype
+
+```{r}
+res_treatment <- fit_and_save(
+  sig19,
+  rhs = "treatment + sex",
+  emm = ~ treatment,
+  contrast_args = list(method = "trt.vs.ctrl", ref = "isotype"),
+  name = "sig19_iln_treatment",
+  padj_source = "emmeans"
+)
+```
+
+```{r, fig.height=4, fig.width=12}
+res_treatment %>%
+  mutate(contrast = str_remove(contrast, " - isotype")) %>%
+  ggplot(aes(x = estimate, y = -log10(padj))) +
+  geom_point() +
+  geom_hline(yintercept = 1, linetype = "dotted", color = "red") +
+  facet_wrap(~contrast, nrow = 1) +
+  theme(aspect.ratio = 1) +
+  labs(title = "Activity change vs isotype")
+```
+
+## All pairwise treatment comparisons
+
+```{r}
+res_pairs <- fit_and_save(
+  sig19,
+  rhs = "treatment + sex",
+  emm = ~ treatment,
+  contrast_args = list(method = "pairwise"),
+  name = "sig19_iln_treatment_pairs",
+  padj_source = "emmeans"
+)
+```
+
+## Combination synergy
+
+The synergy contrasts are user-specified weights, for which emmeans applies no
+adjustment at all -- there is no Dunnett or Tukey family to correct within. These two
+models therefore keep the folder's default, BH across the 38 activities within each
+contrast, so the synergy p-values stay corrected for something. (The original
+analysis corrected these with `p.adjust()`'s default, which is holm, not BH.)
+
+```{r}
+res_synergy <- fit_and_save(
+  sig19,
+  rhs = "treatment + sex",
+  emm = ~ treatment,
+  contrast_args = list(method = synergy_contrasts),
+  name = "sig19_iln_treatment_synergy"
+)
+
+res_synergy %>%
+  filter(padj < 0.1) %>%
+  select(contrast, component, estimate, padj) %>%
+  arrange(padj)
+```
+
+# Celltype associations
+
+## Celltype identity
+
+Which activities distinguish the leiden clusters from one another
+
+```{r}
+res_celltype <- fit_and_save(
+  sig19_celltype,
+  rhs = "celltype + sex",
+  emm = ~ celltype,
+  contrast_args = list(method = "del.eff"),
+  name = "sig19_iln_celltype",
+  padj_source = "emmeans"
+)
+```
+
+```{r}
+res_celltype_pairs <- fit_and_save(
+  sig19_celltype,
+  rhs = "celltype + sex",
+  emm = ~ celltype,
+  contrast_args = list(method = "pairwise"),
+  name = "sig19_iln_celltype_pairs",
+  padj_source = "emmeans"
+)
+```
+
+
+## Treatment x celltype
+
+```{r}
+res_treatment_celltype <- fit_and_save(
+  sig19_celltype,
+  rhs = "treatment * celltype + sex",
+  emm = ~ treatment | celltype,
+  contrast_args = list(method = "trt.vs.ctrl", ref = "isotype"),
+  padj_by = c("contrast", "celltype"),
+  name = "sig19_iln_celltype_treatment",
+)
+```
+
+## Combination synergy x celltype
+
+```{r}
+res_synergy_celltype <- fit_and_save(
+  sig19_celltype,
+  rhs = "treatment * celltype + sex",
+  emm = ~ treatment | celltype,
+  contrast_args = list(method = synergy_contrasts),
+  padj_by = c("contrast", "celltype"),
+  name = "sig19_iln_celltype_treatment_synergy"
+)
+
+res_synergy_celltype %>%
+  filter(padj < 0.1) %>%
+  count(contrast, celltype, name = "n_activities") %>%
+  arrange(desc(n_activities))
+```
+
+Results are written to `analysis_outs/03_activity_inference_model/inference_model_disease_bulk/regressions/`
+and visualized in `11_viz_sig19.Rmd`.

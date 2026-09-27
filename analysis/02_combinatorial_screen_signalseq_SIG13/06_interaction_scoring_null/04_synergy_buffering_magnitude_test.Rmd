@@ -1,0 +1,298 @@
+---
+title: "Buffering and Synergy Calls vs. Expected Additive Effect: Real Compared to Null"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup}
+library(tidyverse)
+library(data.table)
+library(scales)
+knitr::opts_chunk$set(echo = TRUE)
+
+# Repo-relative paths (inputs: imports_stable/, outputs: analysis_outs/)
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "02_combinatorial_screen_signalseq_SIG13")
+dir.create(file.path(outs_dir, "plots/interaction_scoring_null"), recursive = TRUE, showWarnings = FALSE)
+source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
+theme_set(theme_Publication())
+
+filter_cutoff <- 0.1
+real_interaction_dir <- file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/glmGamPoi_interaction")
+null_dir <- file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/glmGamPoi_null")
+plot_dir <- file.path(outs_dir, "plots/interaction_scoring_null")
+
+source_pal <- c(null = "#666666FF", real = "#1B9E77FF")
+```
+
+# Goal
+
+`interaction_scoring_v3.R` reports that synergy is most common in genes whose
+expected additive effect is near zero, and buffering in genes where it is large.
+This notebook asks whether that pattern is stronger in the real data than in the
+empirical null built from the 9 non-targeting linker barcodes.
+
+Each class is compared only with itself, real vs. null:
+
+- **Buffering:** do real buffering calls come from genes with larger
+  `|lfc_additive_expected|` than null buffering calls?
+- **Synergy:** do real synergy calls come from genes with smaller
+  `|lfc_additive_expected|` than null synergy calls?
+
+The null shows where calls land when no biology drives them. The question is
+whether the real data departs from that in the predicted direction.
+
+Quantities per gene x ligand pair, from the interaction GLM:
+
+- `lfc_ligand1`, `lfc_ligand2`: single-ligand coefficients
+- `lfc_interaction`: the `ligand1:ligand2` coefficient
+- `lfc_additive_expected = lfc_ligand1 + lfc_ligand2`: the expected additive
+  effect, which is the quantity under test
+- `lfc_total_interaction_model = lfc_additive_expected + lfc_interaction`
+- `interaction_score = lfc_interaction / lfc_total_interaction_model`: its sign
+  sets the class (negative = buffering, positive = synergy)
+
+## Two corrections
+
+A naive real vs. null comparison is confounded in two ways.
+
+**1. Percentile scale.** The null has no true effects, so all of its LFCs are
+smaller. Real calls would sit at higher raw LFCs for that reason alone. To
+remove this, `|lfc_additive_expected|` is converted to a percentile within each
+source's own gene-tests, before any selection.
+
+**2. Rate-matched selection.** At `adj_pval <= 0.1` the real data calls ~42x
+more of its gene-tests than the null does. The null's few calls then come only
+from the extreme tail of its distribution, which pushes them toward percentile 1.
+To avoid this, both sources contribute the same fraction of gene-tests: the top
+hits by interaction p-value, with the fraction set to the null's
+`adj_pval <= 0.1` rate.
+
+# Load and derive quantities at matched filter_cutoff = 0.1
+
+```{r}
+build_table <- function(interaction_file, singles_file, source_label) {
+  interactionTbl <- fread(interaction_file, select = c("name", "pval", "adj_pval", "lfc", "interaction")) %>%
+    as_tibble() %>%
+    rename(lfc_interaction = lfc, adj_pval_interaction = adj_pval, pval_interaction = pval)
+
+  singlesTbl <- fread(singles_file, select = c("name", "lfc", "interaction", "single_ligand")) %>%
+    as_tibble() %>%
+    mutate(ligand_slot = if_else(grepl("_round1$", single_ligand), "lfc_ligand1", "lfc_ligand2")) %>%
+    select(name, interaction, ligand_slot, lfc) %>%
+    pivot_wider(names_from = ligand_slot, values_from = lfc)
+
+  interactionTbl %>%
+    inner_join(singlesTbl, by = c("name", "interaction")) %>%
+    mutate(
+      lfc_additive_expected = lfc_ligand1 + lfc_ligand2,
+      abs_additive = abs(lfc_additive_expected),
+      lfc_total_interaction_model = lfc_additive_expected + lfc_interaction,
+      interaction_score = lfc_interaction / lfc_total_interaction_model,
+      source = source_label
+    )
+}
+
+realCombined <- build_table(
+  file.path(real_interaction_dir, paste0("glmGamPoi_interaction_lfc_", filter_cutoff, "filter.csv")),
+  file.path(real_interaction_dir, paste0("glmGamPoi_singles_lfc_", filter_cutoff, "filter.csv")),
+  "real"
+)
+
+nullCombined <- build_table(
+  file.path(null_dir, paste0("glmGamPoi_interaction_null_lfc_", filter_cutoff, "filter.csv")),
+  file.path(null_dir, paste0("glmGamPoi_interaction_null_singles_lfc_", filter_cutoff, "filter.csv")),
+  "null"
+)
+```
+
+## Percentile of the expected additive effect
+
+Computed within each source over all of its gene-tests, before any selection.
+
+```{r}
+allCombined <- bind_rows(realCombined, nullCombined) %>%
+  group_by(source) %>%
+  mutate(pct_abs_additive = percent_rank(abs_additive)) %>%
+  ungroup()
+
+allCombined %>% count(source, name = "n_gene_tests")
+```
+
+The difference in effect size between sources, which the percentile scale
+removes:
+
+```{r}
+allCombined %>%
+  group_by(source) %>%
+  summarise(
+    n = n(),
+    median_abs_additive = median(abs_additive, na.rm = TRUE),
+    q90_abs_additive = quantile(abs_additive, 0.9, na.rm = TRUE),
+    median_abs_interaction = median(abs(lfc_interaction), na.rm = TRUE),
+    q90_abs_interaction = quantile(abs(lfc_interaction), 0.9, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  knitr::kable(digits = 4)
+```
+
+## Hit rates and the matching fraction
+
+```{r}
+gatingRate <- allCombined %>%
+  group_by(source) %>%
+  summarise(
+    n_gene_tests = n(),
+    n_gated = sum(adj_pval_interaction <= 0.1, na.rm = TRUE),
+    gated_rate = n_gated / n_gene_tests,
+    .groups = "drop"
+  )
+
+knitr::kable(gatingRate, digits = 6)
+```
+
+At `adj_pval <= 0.1`, the real data calls
+`r sprintf("%.2f%%", 100 * gatingRate$gated_rate[gatingRate$source == "real"])`
+of its gene-tests and the null calls
+`r sprintf("%.3f%%", 100 * gatingRate$gated_rate[gatingRate$source == "null"])`.
+The null's rate is used as the matching fraction for both.
+
+# Rate-matched selection
+
+Each source keeps its top `match_rate` fraction of gene-tests by interaction
+p-value. Each kept gene-test is classed by the sign of `interaction_score`.
+
+```{r}
+match_rate <- gatingRate$gated_rate[gatingRate$source == "null"]
+match_rate
+
+rateMatched <- allCombined %>%
+  group_by(source) %>%
+  mutate(pval_frac = percent_rank(pval_interaction)) %>%
+  ungroup() %>%
+  filter(pval_frac <= match_rate, is.finite(interaction_score)) %>%
+  mutate(class_group = if_else(interaction_score < 0, "buffering", "synergy"))
+
+rateMatched %>%
+  count(source, class_group) %>%
+  group_by(source) %>%
+  mutate(frac = n / sum(n)) %>%
+  ungroup() %>%
+  knitr::kable(digits = 4)
+```
+
+This table is a result in its own right. It shows the buffering/synergy split
+among each source's strongest interactions, with both sources selected at the
+same rate.
+
+# Real vs. null within each class
+
+```{r}
+# oriented real - null: positive rank_biserial means real sits higher
+source_summary <- function(df, value_col) {
+  x <- df[[value_col]][df$source == "null"]
+  y <- df[[value_col]][df$source == "real"]
+  test <- suppressWarnings(wilcox.test(x, y))
+  n1 <- length(x)
+  n2 <- length(y)
+  tibble(
+    n_null = n1, n_real = n2,
+    median_null = median(x, na.rm = TRUE), median_real = median(y, na.rm = TRUE),
+    mean_null = mean(x, na.rm = TRUE), mean_real = mean(y, na.rm = TRUE),
+    delta_mean = mean(y, na.rm = TRUE) - mean(x, na.rm = TRUE),
+    p_value = test$p.value,
+    # as.numeric() guards against 32-bit integer overflow in n1*n2
+    rank_biserial = unname(1 - (2 * as.numeric(test$statistic)) / (as.numeric(n1) * as.numeric(n2)))
+  )
+}
+
+# two-sample Kolmogorov-Smirnov on the same real-vs-null contrast.
+# ks_D is the maximum vertical gap between the two ECDFs; ks_signed_D records
+# where that gap sits, positive meaning real's ECDF runs above null's (real
+# shifted toward LOWER percentiles), so it carries the direction that the
+# two-sided D statistic discards.
+ks_summary <- function(df, value_col) {
+  x <- df[[value_col]][df$source == "null"]
+  y <- df[[value_col]][df$source == "real"]
+  test <- suppressWarnings(ks.test(y, x))
+  grid <- sort(unique(c(x, y)))
+  gap <- ecdf(y)(grid) - ecdf(x)(grid)
+  tibble(
+    ks_D = unname(test$statistic),
+    ks_signed_D = gap[which.max(abs(gap))],
+    ks_at_percentile = grid[which.max(abs(gap))],
+    ks_p = test$p.value
+  )
+}
+
+absAdditiveResults <- rateMatched %>%
+  group_by(class_group) %>%
+  group_modify(~ source_summary(.x, "pct_abs_additive")) %>%
+  ungroup()
+
+ksResults <- rateMatched %>%
+  group_by(class_group) %>%
+  group_modify(~ ks_summary(.x, "pct_abs_additive")) %>%
+  ungroup()
+
+absAdditiveResults %>%
+  left_join(ksResults, by = "class_group") %>%
+  knitr::kable(digits = 4)
+```
+
+```{r, fig.width=8, fig.height=5}
+ggplot(rateMatched, aes(x = source, y = pct_abs_additive, fill = source)) +
+  geom_boxplot(outlier.size = 0.5) +
+  scale_fill_manual(values = source_pal) +
+  scale_y_continuous(limits = c(0, 1)) +
+  facet_wrap(~class_group) +
+  labs(x = NULL, y = "percentile of |lfc_additive_expected| (within source)", fill = NULL,
+       title = "Expected additive effect, real vs. null within class",
+       subtitle = "rate-matched selection; percentile within each source's own distribution") +
+  theme(aspect.ratio = 1)
+ggsave(file.path(plot_dir, "05_rate_matched_abs_additive_boxplot.pdf"))
+```
+
+```{r, fig.width=8, fig.height=5}
+ksLabels <- ksResults %>%
+  mutate(label = sprintf("KS D = %.3f\np = %s", ks_D, format.pval(ks_p, digits = 2)))
+
+ggplot(rateMatched, aes(x = pct_abs_additive, color = source)) +
+  stat_ecdf(linewidth = 0.8) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey60") +
+  geom_segment(
+    data = ksResults, inherit.aes = FALSE,
+    aes(x = ks_at_percentile, xend = ks_at_percentile,
+        y = 0, yend = abs(ks_signed_D)),
+    colour = "black", linewidth = 0.4, linetype = "dotted"
+  ) +
+  geom_text(
+    data = ksLabels, inherit.aes = FALSE,
+    aes(x = 0.05, y = 0.95, label = label),
+    hjust = 0, vjust = 1, size = 3, colour = "black"
+  ) +
+  scale_color_manual(values = source_pal) +
+  facet_wrap(~class_group) +
+  labs(x = "percentile of |lfc_additive_expected| (within source)",
+       y = "cumulative fraction", color = NULL,
+       title = "Percentile ECDF, real vs. null within class",
+       subtitle = "dashed = ungated background (uniform); dotted = location of the maximum KS gap") +
+  theme(aspect.ratio = 1)
+ggsave(file.path(plot_dir, "05_rate_matched_abs_additive_ecdf.pdf"))
+```
+
+The dashed diagonal is what an unselected set of gene-tests would give, since
+percentiles are uniform by construction. A curve below the diagonal means that
+class is enriched at large `|lfc_additive_expected|`. A curve above it means the
+class is enriched near zero.

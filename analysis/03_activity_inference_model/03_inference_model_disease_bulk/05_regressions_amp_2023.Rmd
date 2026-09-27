@@ -1,0 +1,180 @@
+---
+title: "Ligand Activity Regressions: AMP 2023 (rheumatoid arthritis)"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE)
+source("regression_helpers.R")
+```
+
+# Goal
+
+Test which SIG13 ligand activities differ in RA synovial CD4 T cells (AMP Phase 2),
+using the activity scores from `02_score_disease_datasets.py`.
+
+Two questions, each asked across all CD4 T cells and per celltype:
+
+1. **Disease** -- RA vs osteoarthritis control
+2. **CTAP** -- do the AMP cell-type-abundance phenotypes (the synovial tissue
+   "neighbourhoods") differ in the combinatorial signals CD4 T cells experience?
+
+**Covariates:** sex, scaled age, and joint in every model. Age is complete for all
+77 biopsies, so unlike the atlas there is no missingness argument for binning it.
+Joint matters most: the osteoarthritis controls are drawn from different joints than
+the RA biopsies (RA is mostly knee and wrist), so it is adjusted for throughout. The
+earlier analysis omitted age from the celltype models but not the whole-biopsy ones.
+
+# Import
+
+```{r}
+AMP_KEYS <- c("subject_id", "biopsy_id", "joint", "sex", "treatment", "CTAP",
+              "das28_crp3_binary")
+
+# `Repeat` biopsies are repeat sampling of the same joint, excluded here; they are
+# also exactly the samples with no CTAP assignment.
+prepare_amp <- function(df) {
+  df %>%
+    filter(treatment != "Repeat") %>%
+    mutate(disease_binary = factor(ifelse(treatment == "osteoarthritis control",
+                                          "control", "RA"), c("RA", "control")),
+           das28_crp3_binary = factor(das28_crp3_binary, c("high", "low", "control")),
+           across(c(sex, joint, CTAP), factor),
+           age = as.vector(scale(age)))
+}
+
+amp <- load_activity_scores("amp_2023", AMP_KEYS) %>% prepare_amp()
+amp_celltype <- load_activity_scores("amp_2023_celltype", c(AMP_KEYS, "cluster_name")) %>%
+  rename(celltype = cluster_name) %>%
+  prepare_amp() %>%
+  mutate(celltype = fct_relevel(factor(celltype), "T-4: CD4+ naive"))
+
+activities <- activity_names()
+cat(nrow(amp), "biopsies,", length(activities), "ligand activities\n")
+count(amp, disease_binary, CTAP)
+```
+
+# Covariate QC
+
+```{r, fig.height=6, fig.width=8}
+amp %>%
+  pivot_longer(c(age, CDAI, das28_crp3, das28_esr3, krenn_inflammation, krenn_lining),
+               names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = treatment, y = value, fill = treatment)) +
+  geom_boxplot(show.legend = FALSE, na.rm = TRUE) +
+  facet_wrap(~variable, scales = "free_y") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        aspect.ratio = 1) +
+  labs(title = "Continuous covariates by treatment group", x = "", y = "")
+```
+
+```{r, fig.height=5, fig.width=12}
+map(c("joint", "sex", "CTAP"), function(variable) {
+  ggplot(amp, aes(x = treatment, fill = !!sym(variable))) +
+    geom_bar(position = "fill") +
+    scale_y_continuous(labels = scales::percent) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          aspect.ratio = 1) +
+    labs(title = variable, x = "", y = "proportion")
+}) %>% wrap_plots(nrow = 1)
+```
+
+Joint is the one notable imbalance -- the osteoarthritis controls are dominated by
+one joint -- so it is adjusted for in every model below.
+
+# Disease associations
+
+```{r}
+res_disease <- fit_and_save(
+  amp,
+  rhs = "disease_binary + sex + age + joint",
+  emm = ~ disease_binary,
+  contrast_args = list(method = "pairwise"),
+  name = "amp_2023_disease_binary"
+)
+```
+
+```{r, fig.height=3.5, fig.width=3.5}
+res_disease %>%
+  ggplot(aes(x = estimate, y = -log10(padj))) +
+  geom_point() +
+  geom_hline(yintercept = 1, linetype = "dotted", color = "red") +
+  theme(aspect.ratio = 1) +
+  labs(title = "RA vs OA control")
+```
+
+# CTAP associations
+
+Each CTAP against the osteoarthritis controls. Disease severity is not adjusted for
+here because it is undefined for the controls.
+
+```{r}
+res_ctap <- fit_and_save(
+  amp,
+  rhs = "CTAP + sex + age + joint",
+  emm = ~ CTAP,
+  contrast_args = list(method = "trt.vs.ctrl", ref = "control"),
+  name = "amp_2023_ctap_control_ref"
+)
+```
+
+# Celltype associations
+
+Which activities distinguish CD4 subsets from each other, irrespective of disease.
+`del.eff` contrasts each celltype against the mean of the others; HC3 robust
+covariance is used because the per-celltype sample sizes are uneven.
+
+```{r}
+res_celltype <- fit_and_save(
+  amp_celltype,
+  rhs = "celltype + sex + age + joint",
+  emm = ~ celltype,
+  contrast_args = list(method = "del.eff"),
+  robust = TRUE,
+  name = "amp_2023_celltype"
+)
+```
+
+## Disease x celltype
+
+```{r}
+res_disease_celltype <- fit_and_save(
+  amp_celltype,
+  rhs = "disease_binary * celltype + sex + age + joint",
+  emm = ~ disease_binary | celltype,
+  contrast_args = list(method = "pairwise"),
+  padj_by = c("contrast", "celltype"),
+  name = "amp_2023_disease_celltype"
+)
+```
+
+## CTAP x celltype
+
+HC3 is unstable for this model (many CTAP x celltype cells are small), so
+model-based standard errors are used.
+
+```{r}
+res_ctap_celltype <- fit_and_save(
+  amp_celltype,
+  rhs = "CTAP * celltype + sex + age + joint",
+  emm = ~ CTAP | celltype,
+  contrast_args = list(method = "trt.vs.ctrl", ref = "control"),
+  padj_by = c("contrast", "celltype"),
+  name = "amp_2023_ctap_celltype_control_ref"
+)
+```
+
+```{r}
+res_ctap_celltype %>%
+  filter(padj < 0.1) %>%
+  count(celltype, name = "significant_activity_contrasts") %>%
+  arrange(desc(significant_activity_contrasts))
+```
+
+Results are written to `analysis_outs/03_activity_inference_model/inference_model_disease_bulk/regressions/`
+and visualized in `09_viz_amp_2023.Rmd`.

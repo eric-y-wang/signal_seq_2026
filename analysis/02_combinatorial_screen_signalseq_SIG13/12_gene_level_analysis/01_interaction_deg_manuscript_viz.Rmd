@@ -1,0 +1,643 @@
+---
+title: "Interaction DEG Visualization Manuscript"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup}
+library(tidyverse)
+library(patchwork)
+library(viridisLite)
+library(ggrepel)
+library(ComplexHeatmap)
+library(circlize)
+library(RColorBrewer)
+library(ggpointdensity)
+library(scales)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Repo-relative paths: inputs from imports_stable/, outputs to analysis_outs/
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "02_combinatorial_screen_signalseq_SIG13")
+dir.create(file.path(outs_dir, "plots"), showWarnings = FALSE, recursive = TRUE)
+source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
+theme_set(theme_Publication())
+
+tab10_colors <- c("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", 
+                  "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf")
+
+interaction_palette <- c("#808080","#D95F02","#E7298A","#1B9E77FF")
+```
+
+# Goal
+
+Visualize specific interactions in a presentable way.
+
+# Import
+
+```{r}
+interScored <- readr::read_csv(file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/interactions_scored_v3_glmGamPoi_0.05filter.csv")) %>%
+  mutate(interaction_class = case_when(interaction_class == "additive over saturation" ~ "none",
+                                       interaction_class == "buffering complete" ~ "buffering",
+                                       is.na(interaction_class) ~ "none",
+                                       TRUE ~ interaction_class)) %>%
+  mutate(interaction_class = factor(interaction_class, levels = c("none","buffering","synergy negative","synergy positive"))) %>%
+  mutate(lfc_expected = lfc_ligand1 + lfc_ligand2)
+
+# inter-replicate correlations
+conditionLfcRep <- readr::read_csv(file.path(imports_dir, "SIG13/analysis_outs/replicate_corr/replicate_correlation_singleLfc_0.2filter.csv"))
+interLfcRep <- readr::read_csv(file.path(imports_dir, "SIG13/analysis_outs/replicate_corr/replicate_correlation_interactionLfc_0.2filter.csv"))
+singleLfc <- readr::read_csv(file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/glmGamPoi_single_term/glmGamPoi_singleTerm_lfc_0.05filter.csv"))
+```
+
+# Filter and annotate data
+
+```{r}
+# define consistent ligands by pearson correlation of LFCs
+consistentLigands <- conditionLfcRep %>%
+  filter(pearson_corr > 0.5) %>%
+  pull(condition)
+
+inconsistentInteractions <- interLfcRep %>%
+  filter(pearson_corr <= 0.25) %>%
+  pull(interaction)
+
+inconsistentInteractions
+```
+
+```{r}
+# filter conditions for only consistent ligands
+interScoredSig <- interScored %>%
+  filter(interaction %in% consistentLigands) %>%
+  filter(!interaction %in% inconsistentInteractions) %>%
+  # remove _TGFB1 ligands as it is not active
+  filter(!grepl("_TGFB1", interaction)) %>%
+  # remove genes that are not significannt 
+  filter(adj_pval_condition < 0.1 | interaction_class == "buffering")
+```
+
+# Overall Interaction Effect Viz
+
+Here I will plot the most significant interaction effect for positive and negative synergies
+
+```{r, fig.width=12}
+# slice for most significant effect per synergy
+geneSummary <- interScoredSig %>%
+  filter(interaction_class %in% c("buffering","synergy positive","synergy negative")) %>%
+  group_by(name, interaction_class) %>%
+  slice_min(adj_pval_interaction, n = 1) %>%
+  filter(adj_pval_interaction < 0.001) %>%
+  mutate(logp = pmin(pmax(-log10(adj_pval_interaction), 0), 50)) # cap padj to 0–50
+
+# plot max positive synergy
+p1 <- geneSummary %>%
+  filter(interaction_class == "buffering") %>%
+  ggplot(aes(
+    x = lfc_expected,
+    y = lfc_condition,
+    color = logp,
+  )) +
+      geom_point(alpha=0.5) +
+    scale_color_distiller(
+      palette = "YlOrRd", 
+      direction = 1, 
+      limits = c(0, 50),   # Set upper limit to 50
+      oob = scales::squish  # "Squish" values >50 into the max color
+    ) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+    geom_abline(
+      slope = 1,
+      intercept = 0,
+      linetype = "dashed",
+      color = "red"
+    ) +
+    ggtitle("buffering\nmost significant hit per gene") +
+    xlab("max additive LFC") +
+    ylab("max true LFC") +
+    theme(aspect.ratio = 1)
+
+# plot max negative synergy 
+p2 <- geneSummary %>%
+  filter(interaction_class == "synergy negative") %>%
+  ggplot(aes(
+    x = lfc_expected,
+    y = lfc_condition,
+    color = logp,
+  )) +
+    geom_point(alpha=0.5) +
+    scale_color_distiller(
+      palette = "YlOrRd", 
+      direction = 1, 
+      limits = c(0, 50),  
+      oob = scales::squish
+    ) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+    geom_abline(
+      slope = 1,
+      intercept = 0,
+      linetype = "dashed",
+      color = "red"
+    ) +
+    xlim(-4.2,3.2) +
+    ylim(-4.2,0.5) +
+    ggtitle("synergy negative\nmost significant hit per gene") +
+    xlab("max additive LFC") +
+    ylab("max true LFC") +
+    theme(aspect.ratio = 1)
+
+# plot max positive synergy
+p3 <- geneSummary %>%
+  filter(interaction_class == "synergy positive") %>%
+  ggplot(aes(
+    x = lfc_expected,
+    y = lfc_condition,
+    color = logp,
+  )) +
+    geom_point(alpha=0.5) +
+    scale_color_distiller(
+      palette = "YlOrRd", 
+      direction = 1, 
+      limits = c(0, 50),   # Set upper limit to 50
+      oob = scales::squish  # "Squish" values >50 into the max color
+    ) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+    geom_abline(
+      slope = 1,
+      intercept = 0,
+      linetype = "dashed",
+      color = "red"
+    ) +
+    ggtitle("synergy positive\nmost significant hit per gene") +
+    xlim(-2.7,6.5) +
+    ylim(-2.7,6.5) +
+    xlab("max additive LFC") +
+    ylab("max true LFC") +
+    theme(aspect.ratio = 1)
+
+p1+p2+p3
+ggsave(file.path(outs_dir, "plots/most_sig_interaction_per_gene.pdf"))
+```
+
+# Interaction Class Overview
+
+```{r, fig.height=4, fig.width=12}
+doubleStims <- c(
+  "IL2_IL2",
+  "IL4_IL4",
+  "IL6_IL6",
+  "IL12_IL12",
+  "IFNG_IFNG",
+  "TNF_TNF",
+  "IL7_IL7",
+  "IL21_IL21"
+)
+
+combinations_with_effects <- singleLfc %>%
+  filter(adj_pval < 0.1) %>%
+  group_by(condition) %>%
+  summarise(n = n()) %>%
+  filter(n > 50) %>%
+  pull(condition)
+
+interScoredSig %>%
+  # keep only your desired interactions
+  filter(!str_detect(interaction, "linker")) %>%
+  filter(!(interaction %in% doubleStims))  %>%
+  filter(interaction %in% combinations_with_effects) %>%
+  filter(interaction_class != "additive over saturation") %>%
+  mutate(interaction_class = case_when(interaction_class == "buffering complete" ~ "buffering",
+                                       TRUE ~ interaction_class)) %>%
+  # count & compute proportions
+  count(interaction, interaction_class, name = "count") %>%
+  group_by(interaction) %>%
+  mutate(proportion = count / sum(count) * 100) %>%
+  ungroup() %>%
+  filter(interaction_class != "none") %>%
+  # 1) sort interactions by total non-none proportion (desc)
+  mutate(interaction = fct_reorder(interaction, proportion, .fun = sum, .desc = TRUE)) %>%
+  ggplot(aes(x = interaction, y = proportion, fill = interaction_class)) +
+    geom_col(width = 1) +
+    scale_x_discrete(expand = c(0, 0)) +
+    scale_y_continuous(expand = c(0, 0)) +
+    scale_fill_manual(values = interaction_palette, breaks = c("none","buffering","synergy negative","synergy positive")) +
+    labs(
+      x     = "Ligand Combinations > 50 DEGs (excluding double stim and linkers)",
+      y     = "Percent of DEGs",
+      fill  = "Interaction Class",
+      title = "Class Frequency per Interaction"
+    ) +
+    theme(
+      axis.text.x  = element_blank(),
+      axis.ticks.x = element_blank()
+    )
+
+ggsave(file.path(outs_dir, "plots/class_frequency_per_interaction_barplots.pdf"))
+```
+
+```{r}
+interScoredSig %>%
+  # keep only your desired interactions
+  filter(!str_detect(interaction, "linker")) %>%
+  filter(!(interaction %in% doubleStims))  %>%
+  filter(interaction %in% combinations_with_effects) %>%
+  filter(interaction_class != "additive over saturation") %>%
+  mutate(interaction_class = case_when(interaction_class == "buffering complete" ~ "buffering",
+                                       TRUE ~ interaction_class)) %>%
+  # count & compute proportions
+  count(interaction, interaction_class, name = "count") %>%
+  group_by(interaction) %>%
+  mutate(proportion = count / sum(count) * 100) %>%
+  ungroup() %>%
+  filter(interaction_class != "none") %>%
+  ggplot(aes(x = interaction_class, y = proportion, fill = interaction_class)) +
+  geom_boxplot() +
+  scale_y_log10() +
+  scale_fill_manual(values = interaction_palette, breaks = c("none","buffering","synergy negative","synergy positive")) +
+  theme(aspect.ratio=1) +
+  annotation_logticks(sides = "l")
+ggsave(file.path(outs_dir, "plots/class_frequency_boxplots.pdf"))
+```
+```{r}
+interScoredSig %>%
+  # keep only your desired interactions
+  filter(!str_detect(interaction, "linker")) %>%
+  filter(!(interaction %in% doubleStims))  %>%
+  filter(interaction %in% combinations_with_effects) %>%
+  filter(interaction_class != "additive over saturation") %>%
+  mutate(interaction_class = case_when(interaction_class == "buffering complete" ~ "buffering",
+                                       TRUE ~ interaction_class)) %>%
+  # count & compute proportions
+  count(interaction, interaction_class, name = "count") %>%
+  group_by(interaction) %>%
+  mutate(proportion = count / sum(count) * 100) %>%
+  ungroup() %>%
+  filter(interaction_class != "none") %>%
+  group_by(interaction_class) %>%
+  summarise(min = min(proportion),
+            max = max(proportion),
+            mean = mean(proportion),
+            median = median(proportion))
+```
+
+
+```{r}
+temp <- interScoredSig %>%
+  # keep only your desired interactions
+  filter(!str_detect(interaction, "linker")) %>%
+  filter(!(interaction %in% doubleStims))  %>%
+  filter(interaction %in% combinations_with_effects) %>%
+  filter(interaction_class != "additive over saturation") %>%
+  mutate(interaction_class = case_when(interaction_class == "buffering complete" ~ "buffering",
+                                       TRUE ~ interaction_class)) %>%
+  # count & compute proportions
+  count(interaction, interaction_class, name = "count") %>%
+  group_by(interaction) %>%
+  mutate(proportion = count / sum(count) * 100) %>%
+  ungroup()
+
+no_interaction <- temp %>%
+  filter(interaction_class == "none" & proportion == 100) %>%
+  pull(interaction) %>%
+  unique()
+
+# get number of conditions with no interaction effects
+length(no_interaction)/length(temp$interaction %>% unique())
+```
+
+
+# Interaction vs DEG Relationship
+
+```{r}
+interScoredSummary <- interScoredSig %>%
+  group_by(interaction) %>%
+  summarise(
+    n_interactions = sum(interaction_class %in% c("synergy positive", "synergy negative"), na.rm = TRUE),
+    n_degs_1 = sum(adj_pval_ligand1 < 0.1, na.rm = TRUE),
+    n_degs_2 = sum(adj_pval_ligand2 < 0.1, na.rm = TRUE),
+    n_degs_total = n()
+  ) %>%
+  mutate(freq_interactions = n_interactions/n_degs_total) %>%
+  filter(n_interactions > 20) %>%
+  filter(n_degs_total > 50) %>%
+  mutate(label_this = case_when(interaction %in% c("IL21_IL1B","IL6_IL1B") ~ interaction,
+                                TRUE ~ NA_character_))
+
+interScoredSummary %>%
+  ggplot(aes(x = n_degs_1, y = n_degs_2)) +
+  geom_point(aes(size = n_interactions, color = log2(n_interactions))) +
+  geom_text_repel(aes(label = label_this)) +
+  scale_color_viridis_c() +
+  theme(aspect.ratio = 1) +
+  ggtitle("Synergistic Interactions by DEGs")
+ggsave(file.path(outs_dir, "plots/interactions_synergistic_vs_deg_dotplot.pdf"))
+
+interScoredSummary %>%
+  ggplot(aes(x = n_degs_total, y = freq_interactions)) +
+  geom_point() +
+  geom_text_repel(aes(label = label_this)) +
+  theme(aspect.ratio = 1) +
+  ggtitle("Synergistic Interactions by DEGs")
+ggsave(file.path(outs_dir, "plots/interactions_synergistic_vs_deg_scatterplot.pdf"))
+```
+
+
+# Expected Example Viz
+
+```{r, fig.width=15}
+p1 <- interScoredSig %>%
+  filter(name == "Bcl6") %>%
+    ggplot(aes(
+      x = lfc_expected,
+      y = lfc_condition,
+      color = interaction_class
+    )) +
+    geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    geom_point() +
+    geom_text_repel(aes(label = ifelse(interaction_class == "synergy negative",interaction,"")), show.legend = FALSE,size = 3) +
+    scale_color_manual(values = interaction_palette) +
+    xlab("expected LFC") +
+    ylab("observed LFC") +
+    theme(aspect.ratio = 1) +
+    ggtitle("Bcl6")
+
+p2 <- interScoredSig %>%
+  filter(name == "Foxp3") %>%
+    ggplot(aes(
+      x = lfc_expected,
+      y = lfc_condition,
+      color = interaction_class
+    )) +
+    geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    geom_point() +
+    geom_text_repel(aes(label = ifelse(interaction_class == "synergy positive",interaction,"")), show.legend = FALSE,size = 3) +
+    scale_color_manual(values = interaction_palette) +
+    xlab("expected LFC") +
+    ylab("observed LFC") +
+    theme(aspect.ratio = 1) +
+    ggtitle("Foxp3")
+
+p3 <- interScoredSig %>%
+  filter(name == "Cxcr5") %>%
+    ggplot(aes(
+      x = lfc_expected,
+      y = lfc_condition,
+      color = interaction_class
+    )) +
+    geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    geom_point() +
+    geom_text_repel(aes(label = ifelse(interaction_class == "synergy negative",interaction,"")), show.legend = FALSE,size = 3) +
+    scale_color_manual(values = interaction_palette) +
+    xlab("expected LFC") +
+    ylab("observed LFC") +
+    theme(aspect.ratio = 1) +
+    ggtitle("Cxcr5")
+
+p1+p2+p3
+```
+
+# TNF interaction viz
+
+```{r}
+# Define the specific order for the categories
+cat_levels <- c("IL2_TNF", "IL4_TNF", "IL7_TNF", "IL6_TNF", "IL21_TNF", 
+                "IL27_TNF", "IFNG_TNF", "TGFB1_TNF", "TNF_TNF", "single")
+
+# subset and apply factor order
+pattern <- "^(IL2|IL4|IL6|IL7|IL21|IL27|TGFB1|IFNG)_(TNF.*|linker)|^linker_TNF.*|^TNF_TNF.*"
+interScoredSigTnf <- interScoredSig %>%
+  filter(!grepl("TNFSF9|TNFSF14", interaction)) %>%
+  filter(grepl(pattern, interaction)) %>%
+  mutate(category = case_when(
+    grepl("linker", interaction) ~ "single",
+    grepl(pattern, interaction) ~ sub("^([^_]+)_TNF.*", "\\1_TNF", interaction),
+    TRUE ~ "other"
+  )) %>%
+  mutate(lfc_expected = case_when(category == "single" ~ lfc_condition,
+                                  TRUE ~ lfc_expected)) %>%
+  mutate(category = factor(category, levels = cat_levels))
+```
+
+
+```{r, fig.height=10, fig.width=10}
+p1 <- interScoredSigTnf %>%
+  filter(!(category %in% c("other","single"))) %>%
+  filter(name == "Gata3") %>%
+    ggplot(aes(
+      x = lfc_expected,
+      y = lfc_condition,
+      color = category
+    )) +
+    geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    geom_point() +
+    #geom_text_repel(aes(label = interaction), show.legend = FALSE,size = 3) +
+    scale_color_manual(values = tab10_colors, breaks = cat_levels) +
+    xlim(-0.5, 2.5) +
+    ylim(-0.5, 2.5) +
+    xlab("expected LFC") +
+    ylab("observed LFC") +
+    theme(aspect.ratio = 1) +
+    ggtitle("Gata3")
+
+p3 <- interScoredSigTnf %>%
+  filter(!(category %in% c("other","single"))) %>%
+  filter(name == "Tagap") %>%
+    ggplot(aes(
+      x = lfc_expected,
+      y = lfc_condition,
+      color = category
+    )) +
+    geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    geom_point() +
+    #geom_text_repel(aes(label = interaction), show.legend = FALSE,size = 3) +
+    scale_color_manual(values = tab10_colors, breaks = cat_levels) +
+    xlim(-1.5, 4) +
+    ylim(-1.5, 4) +
+    xlab("expected LFC") +
+    ylab("observed LFC") +
+    theme(aspect.ratio = 1) +
+    ggtitle("Tagap")
+
+p2 <- interScoredSigTnf %>%
+  filter(!(category %in% c("other","single"))) %>%
+  filter(name == "Batf") %>%
+    ggplot(aes(
+      x = lfc_expected,
+      y = lfc_condition,
+      color = category
+    )) +
+    geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    geom_point() +
+    #geom_text_repel(aes(label = interaction), show.legend = FALSE,size = 3) +
+    scale_color_manual(values = tab10_colors, breaks = cat_levels) +
+    xlim(-1, 3.5) +
+    ylim(-1, 3.5) +
+    xlab("expected LFC") +
+    ylab("observed LFC") +
+    theme(aspect.ratio = 1) +
+    ggtitle("Batf")
+
+p4 <- interScoredSigTnf %>%
+  filter(!(category %in% c("other","single"))) %>%
+  filter(name == "Ahnak") %>%
+    ggplot(aes(
+      x = lfc_expected,
+      y = lfc_condition,
+      color = category
+    )) +
+    geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    geom_point() +
+    #geom_text_repel(aes(label = interaction), show.legend = FALSE,size = 3) +
+    scale_color_manual(values = tab10_colors, breaks = cat_levels) +
+    xlim(-1.3, 1.3) +
+    ylim(-1.3, 1.3) +
+    xlab("expected LFC") +
+    ylab("observed LFC") +
+    theme(aspect.ratio = 1) +
+    ggtitle("Ahnak")
+
+p1+p2+p3+p4+plot_layout(ncol=2)
+ggsave(file.path(outs_dir, "plots/tnf_family_deg_examples.pdf"))
+```
+
+
+```{r, fig.width=12, fig.height=12}
+doubleStims <- c(
+  "IL2_IL2",
+  "IL4_IL4",
+  "IL6_IL6",
+  "IL12_IL12",
+  "IFNG_IFNG",
+  "TNF_TNF",
+  "IL7_IL7",
+  "IL21_IL21"
+)
+
+p1 <- interScoredSig %>%
+  filter(!(interaction %in% doubleStims)) %>%
+  filter(name == "Foxp3") %>%
+  filter(adj_pval_condition < 0.01) %>%
+    ggplot(aes(x = lfc_expected,y = lfc_condition)) +
+    geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    geom_point(aes(color = interaction_class)) +
+    geom_text_repel(aes(label = ifelse(interaction == "TGFB1_IL2",interaction,"")),
+                    show.legend = FALSE,size = 3) +
+    scale_color_manual(values = interaction_palette) +
+    xlim(-0.5, 2.5) +
+    ylim(-0.5, 2.5) +
+    xlab("expected LFC") +
+    ylab("observed LFC") +
+    theme(aspect.ratio = 1) +
+    ggtitle("Foxp3")
+
+p2 <- interScoredSig %>%
+  filter(!(interaction %in% doubleStims)) %>%
+  filter(adj_pval_condition < 0.01) %>%
+  filter(name == "Gata3") %>%
+    ggplot(aes(x = lfc_expected,y = lfc_condition)) +
+    geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    geom_point(aes(color = interaction_class)) +
+    geom_text_repel(aes(label = ifelse(interaction == "TGFB1_IL4",interaction,"")),
+                    show.legend = FALSE, max.overlaps = 100) +
+    scale_color_manual(values = interaction_palette) +
+    xlim(-0.5, 2.5) +
+    ylim(-0.5, 2.5) +
+    xlab("expected LFC") +
+    ylab("observed LFC") +
+    theme(aspect.ratio = 1) +
+    ggtitle("Gata3")
+
+label = c("IL6_IL2","IL21_IL2")
+p3 <- interScoredSig %>%
+  filter(!(interaction %in% doubleStims)) %>%
+  filter(adj_pval_condition < 0.01) %>%
+  filter(name == "Bcl6") %>%
+    ggplot(aes(x = lfc_expected,y = lfc_condition)) +
+    geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    geom_point(aes(color = interaction_class)) +
+    geom_text_repel(aes(label = ifelse(interaction %in% label,interaction,"")),
+                    show.legend = FALSE, max.overlaps = 100) +
+    scale_color_manual(values = interaction_palette) +
+    xlim(-5, 2) +
+    ylim(-5, 2) +
+    xlab("expected LFC") +
+    ylab("observed LFC") +
+    theme(aspect.ratio = 1) +
+    ggtitle("Bcl6")
+
+p1+p2+p3+plot_layout(ncol = 2)
+ggsave(file.path(outs_dir, "plots/Th_diff_example_synergies_full_plots.pdf"))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

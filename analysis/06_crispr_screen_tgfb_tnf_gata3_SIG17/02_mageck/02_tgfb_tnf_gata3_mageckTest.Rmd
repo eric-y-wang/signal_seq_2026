@@ -1,0 +1,426 @@
+---
+title: "SIG17 CRISPR screen — Gata3 analysis (MAGeCK test)"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(patchwork)
+library(ggrepel)
+library(RColorBrewer)
+library(scales)
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# Repo-relative paths: inputs from imports_stable/, outputs to analysis_outs/
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "06_crispr_screen_tgfb_tnf_gata3_SIG17")
+```
+
+```{r theme}
+source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
+dir.create(file.path(outs_dir, "crispr_screen_tgfb_tnf_gata3"), recursive = TRUE, showWarnings = FALSE)
+theme_set(theme_Publication())
+```
+
+# Goal
+
+Focus on the **Gata3** arm of the SIG17 CRISPR screen (TGFb + TNF condition).
+Naive CD4 T cells were perturbed, then sorted into 4 bins by GATA3-reporter
+expression (bin 1 = lowest, bin 4 = highest). Each higher bin is compared to
+bin 1 with `mageck test`, so a positive gene-level LFC means a gene's sgRNAs
+are **enriched** in cells with higher GATA3 (knockout pushes cells toward high
+GATA3), and a negative LFC means **depleted** (knockout pushes toward low GATA3).
+
+# Import
+
+```{r import}
+pipe_dir <- file.path(imports_dir, "SIG17/dedup_pipeline_output")
+test_dir <- file.path(pipe_dir, "05_mageck_test_dedup")
+
+# MAGeCK test gene-level summaries: bins 2/3/4 vs bin 1
+test_files <- c(`2` = "TGFb_TNF_gata3_2_v_1.gene_summary.txt",
+                 `3` = "TGFb_TNF_gata3_3_v_1.gene_summary.txt",
+                 `4` = "TGFb_TNF_gata3_4_v_1.gene_summary.txt")
+
+gata3_test <- imap_dfr(test_files, function(f, bin) {
+  read_delim(file.path(test_dir, f), show_col_types = FALSE) %>%
+    transmute(
+      gene = id,
+      bin  = as.integer(bin),
+      lfc  = `neg|lfc`,
+      # neg|lfc and pos|lfc are identical; take the fdr from whichever test
+      # direction matches the sign of the lfc.
+      fdr  = if_else(`neg|lfc` > 0, `pos|fdr`, `neg|fdr`)
+    )
+})
+
+# MAGeCK test sgRNA-level LFC for the highest bin (bin 4 vs bin 1).
+# Only the `test` output carries a per-sgRNA LFC, which the density/tick plot needs.
+sgHi <- read_delim(file.path(test_dir, "TGFb_TNF_gata3_4_v_1.sgrna_summary.txt"),
+                   show_col_types = FALSE)
+```
+
+```{r reshape}
+# add the baseline bin (bin 1): lfc = 0 by construction, no test so fdr = NA
+gata3_test <- gata3_test %>%
+  bind_rows(
+    distinct(gata3_test, gene) %>% mutate(bin = 1L, lfc = 0, fdr = NA_real_)
+  ) %>%
+  arrange(gene, bin)
+
+# direction / significance call used throughout
+sig_thresh <- 0.1
+gata3_test <- gata3_test %>%
+  mutate(
+    significant = !is.na(fdr) & fdr < sig_thresh,
+    direction = case_when(
+      significant & lfc > 0 ~ "enriched (high GATA3)",
+      significant & lfc < 0 ~ "depleted (low GATA3)",
+      TRUE ~ "n.s."
+    )
+  )
+
+dir_pal <- c("enriched (high GATA3)" = "#3B6FB6",
+             "depleted (low GATA3)"  = "#C0392B",
+             "n.s."                  = "grey75")
+```
+
+# Volcano plot (bin 4 vs bin 1)
+
+Gene-level LFC vs -log10(FDR) from the `mageck test` gene summary for the
+TGFb + TNF GATA3 bin 4 vs bin 1 comparison.
+
+```{r volcano, fig.width=6, fig.height=4}
+ggplot(gata3_test %>% filter(bin == 4), aes(lfc, -log10(fdr), color = direction)) +
+  geom_hline(yintercept = -log10(sig_thresh), linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(size = 1.5, alpha = 0.8) +
+  geom_text_repel(
+    data = . %>% filter(significant) %>% slice_max(abs(lfc), n = 15),
+    aes(label = gene), color = "black", size = 3, max.overlaps = 20
+  ) +
+  scale_color_manual(values = dir_pal, name = NULL) +
+  labs(title = "GATA3 bin 4 vs bin 1 (mageck test)",
+       x = "gene LFC", y = expression(-log[10]~FDR)) +
+  theme(aspect.ratio = 1)
+
+ggsave(file.path(outs_dir, "crispr_screen_tgfb_tnf_gata3/gata3_4_vs_1_sgRNA_volcano.pdf"))
+```
+
+## CRISPR LFC vs SIG18 TGFb+TNF interaction coefficient
+
+Same x axis as the volcano (gene-level LFC, bin 4 vs bin 1), but the y axis is
+the **GLM interaction coefficient** for the matching TGFb + TNF condition in the
+SIG18 bulk ligand-combination experiment.
+
+```{r import-sig18-interaction}
+sig18_inter <- read_csv(
+  file.path(imports_dir, "SIG18/analysis_outs/deg/res_interaction_scored_SIG18.csv"),
+  show_col_types = FALSE
+) %>%
+  filter(condition == "TGFb-TNF") %>%
+  # one row per gene symbol (a few symbols map to >1 ensembl ID)
+  group_by(gene) %>%
+  slice_min(padj_interaction, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(gene, lfc_interaction, padj_interaction, interaction_class)
+
+# bin 4 CRISPR result joined to the SIG18 interaction term
+crispr_vs_inter <- gata3_test %>%
+  filter(bin == 4) %>%
+  inner_join(sig18_inter, by = "gene")
+
+interaction_palette <- c("none"             = "#808080",
+                         "buffering"        = "#D95F02FF",
+                         "synergy negative" = "#E7298A",
+                         "synergy positive" = "#1B9E77")
+```
+
+```{r crispr-lfc-vs-sig18-interaction, fig.width=5, fig.height=5}
+inter_sig_thresh <- 0.1
+
+crispr_vs_inter %>%
+  # filter for significant CRISPR hits
+  filter(fdr < 0.1) %>%
+  ggplot(aes(lfc, lfc_interaction)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(aes(color = interaction_class,
+                 size = -log10(padj_interaction))) +
+  geom_text_repel(
+    data = . %>%
+      filter(significant, padj_interaction < inter_sig_thresh) %>%
+      slice_max(abs(lfc) * abs(lfc_interaction), n = 20),
+    aes(label = gene), color = "black", size = 3, max.overlaps = 20
+  ) +
+  scale_color_manual(values = interaction_palette, name = "SIG18 class") +
+  scale_size_continuous(range = c(0.8, 4),
+                        name = expression(-log[10]~padj[interaction])) +
+  labs(title = "GATA3 CRISPR screen vs\nSIG18 TGFb+TNF interaction",
+       x = "CRISPR gene LFC\n(bin 4 vs bin 1)",
+       y = "SIG18 interaction\ncoefficient (TGFb+TNF)") +
+  theme(aspect.ratio = 1)
+
+ggsave(file.path(outs_dir, "crispr_screen_tgfb_tnf_gata3/gata3_4_vs_1_lfc_vs_SIG18_TGFb_TNF_interaction.pdf"))
+```
+
+# Highest bin: sgRNA LFC density + per-gene tick plot
+
+Two-panel stacked view for the highest bin (bin 4 vs bin 1), built from the
+per-sgRNA LFC values.
+
+-   **Top:** density of all sgRNA LFCs, with colored vertical lines marking the
+    sgRNAs of a few highlighted genes.
+-   **Bottom:** one row per top gene; gray gradient background fading
+    left-to-right, with each sgRNA drawn as a vertical tick — red if depleted
+    (left / negative LFC), blue if enriched (right / positive LFC).
+
+Top 30 genes by |LFC| in bin 4 are used for the gene set below; the same
+`bin4_lfc` lookup also feeds the curated final figure further down.
+
+```{r top-hits}
+gene_order <- gata3_test %>%
+  filter(bin == 4) %>%
+  slice_max(abs(lfc), n = 30) %>%
+  arrange(lfc) %>%        # most depleted first -> bottom of plot after factor
+  pull(gene)
+
+# bin-4 lfc lookup, reused by the curated final figure to order genes
+bin4_lfc <- gata3_test %>%
+  filter(bin == 4) %>%
+  select(gene, lfc4 = lfc)
+```
+
+```{r hi-bin-prep}
+sg_top <- sgHi %>%
+  filter(Gene %in% gene_order) %>%
+  transmute(gene = factor(Gene, levels = gene_order),
+            sgrna, LFC) %>%
+  mutate(y = as.integer(gene),
+         tick_dir = ifelse(LFC < 0, "depleted", "enriched"))
+
+# shared x range across both panels
+x_rng <- range(sgHi$LFC, na.rm = TRUE)
+x_rng <- x_rng + c(-1, 1) * 0.05 * diff(x_rng)
+
+# background grid: a fine strip of tiles per gene row, shaded by the overall
+# sgRNA LFC density so the background is darkest where sgRNAs are most dense.
+x_grid <- seq(x_rng[1], x_rng[2], length.out = 500)
+lfc_dens <- density(sgHi$LFC, na.rm = TRUE,
+                    from = x_rng[1], to = x_rng[2], n = 500)
+grad_grid <- expand_grid(y = seq_along(gene_order), x = x_grid) %>%
+  mutate(dens = approx(lfc_dens$x, lfc_dens$y, xout = x)$y)
+```
+
+```{r hi-bin-plot, fig.width=8, fig.height=9}
+# ---- top: density of sgRNA LFC ----
+p_top <- ggplot(sgHi, aes(LFC)) +
+  geom_density(fill = "grey80", color = "grey20", alpha = 0.8) +
+  coord_cartesian(xlim = x_rng, expand = FALSE) +
+  labs(y = "density") +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+# ---- bottom: per-gene gradient background + sgRNA ticks ----
+p_bottom <- ggplot() +
+  geom_tile(data = grad_grid, aes(x = x, y = y, fill = dens), height = 0.85) +
+  scale_fill_gradient(low = "grey92", high = "grey20", guide = "none") +
+  geom_segment(data = sg_top,
+               aes(x = LFC, xend = LFC, y = y - 0.4, yend = y + 0.4,
+                   color = tick_dir), linewidth = 0.6) +
+  scale_color_manual(values = c(depleted = "#C0392B", enriched = "#3B6FB6"),
+                     guide = "none") +
+  scale_y_continuous(breaks = seq_along(gene_order), labels = gene_order,
+                     expand = expansion(add = 0.6)) +
+  coord_cartesian(xlim = x_rng, expand = FALSE, clip = "off") +
+  annotate("segment", x = 0, xend = x_rng[1] * 0.9, y = -0.3, yend = -0.3,
+           arrow = arrow(length = unit(0.15, "cm")), color = "#C0392B") +
+  annotate("text", x = x_rng[1] * 0.6, y = -0.9, label = "depleted",
+           color = "#C0392B", size = 3.2) +
+  annotate("segment", x = 0, xend = x_rng[2] * 0.9, y = -0.3, yend = -0.3,
+           arrow = arrow(length = unit(0.15, "cm")), color = "#3B6FB6") +
+  annotate("text", x = x_rng[2] * 0.6, y = -0.9, label = "enriched",
+           color = "#3B6FB6", size = 3.2) +
+  labs(x = "sgRNA LFC (bin 4 vs bin 1)") +
+  theme(axis.text.y = element_text(face = "italic"),
+        axis.title.y = element_blank(),
+        plot.margin = margin(5.5, 5.5, 22, 5.5))
+
+p_top / p_bottom + plot_layout(heights = c(0.5, 3))
+```
+
+# Final Figure for Selected Genes
+
+A manually curated gene set, traced across the sort gradient (bin 1 anchored
+at 0) and paired with the sgRNA LFC density/tick plot for bin 4 vs bin 1.
+
+```{r define genes}
+# plot genes
+plot_genes <- c("Gata3","Nr4a3","Tnfrsf1b","Ddx3x","Tgfbr2","Rel","Ptpn1", #  positive regulators
+               "Il2ra","Ppat","Psma6","Aldoa","Stat5a","Stat5b","Psma4") # negative regulators
+```
+
+```{r hi-bin-plot-curated, fig.width=6, fig.height=6}
+# genes to show as rows
+gene_order <- gata3_test %>%
+  filter(bin == 4, gene %in% plot_genes) %>%
+  arrange(lfc) %>%        # most depleted first -> bottom of plot after factor
+  pull(gene)
+
+# filter to genes to show
+sg_top <- sgHi %>%
+  filter(Gene %in% gene_order) %>%
+  transmute(gene = factor(Gene, levels = gene_order),
+            sgrna, LFC) %>%
+  mutate(y = as.integer(gene),
+         tick_dir = ifelse(LFC < 0, "depleted", "enriched"))
+
+# shared x range across both panels
+x_rng <- c(-5,4)
+
+# background grid: a fine strip of tiles per gene row, shaded by the overall
+# sgRNA LFC density so the background is darkest where sgRNAs are most dense.
+x_grid <- seq(x_rng[1], x_rng[2], length.out = 500)
+lfc_dens <- density(sgHi$LFC, na.rm = TRUE,
+                    from = x_rng[1], to = x_rng[2], n = 500)
+grad_grid <- expand_grid(y = seq_along(gene_order), x = x_grid) %>%
+  mutate(dens = approx(lfc_dens$x, lfc_dens$y, xout = x)$y)
+
+# shared x breaks so the two stacked panels line up
+x_breaks <- seq(ceiling(x_rng[1] / 2) * 2, floor(x_rng[2] / 2) * 2, by = 2)
+
+# ---- top: density of sgRNA LFC ----
+p_top <- ggplot(sgHi, aes(LFC)) +
+  geom_density(fill = "grey80", color = "grey20", alpha = 0.8) +
+  scale_x_continuous(breaks = x_breaks) +
+  scale_y_continuous(limits = c(0, 1.5)) +
+  coord_cartesian(xlim = x_rng, expand = FALSE) +
+  labs(y = "density") +
+  theme(axis.title.x = element_blank(),
+        panel.grid.major = element_blank(),
+        legend.position = "right",
+        legend.key.size = unit(0.4, "cm"))
+
+# ---- bottom: per-gene gradient background + sgRNA ticks ----
+p_bottom <- ggplot() +
+  geom_tile(data = grad_grid, aes(x = x, y = y, fill = dens), height = 0.85) +
+  scale_fill_gradient(low = "grey92", high = "grey20", guide = "none") +
+  geom_segment(data = sg_top,
+               aes(x = LFC, xend = LFC, y = y - 0.4, yend = y + 0.4,
+                   color = tick_dir), linewidth = 1) +
+  scale_color_manual(values = c(depleted = "#C0392B", enriched = "#3B6FB6"),
+                     guide = "none") +
+  scale_y_continuous(breaks = seq_along(gene_order), labels = gene_order,
+                     expand = c(0,0)) +
+  scale_x_continuous(breaks = x_breaks) +
+  coord_cartesian(xlim = x_rng, expand = FALSE, clip = "off") +
+  annotate("segment", x = 0, xend = x_rng[1] * 0.9, y = 0.1, yend = 0.1,
+           arrow = arrow(length = unit(0.15, "cm")), color = "#C0392B") +
+  annotate("text", x = x_rng[1] * 0.6, y = -0.5, label = "depleted",
+           color = "#C0392B", size = 3.2) +
+  annotate("segment", x = 0, xend = x_rng[2] * 0.9, y = 0.1, yend = 0.1,
+           arrow = arrow(length = unit(0.15, "cm")), color = "#3B6FB6") +
+  annotate("text", x = x_rng[2] * 0.6, y = -0.5, label = "enriched",
+           color = "#3B6FB6", size = 3.2) +
+  labs(x = "sgRNA LFC (bin 4 vs bin 1)") +
+  theme(axis.text.y = element_text(face = "italic"),
+        axis.title.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.line.x = element_blank(),
+        axis.line.y = element_blank(),
+        panel.grid.major.x = element_blank(),
+        plot.margin = margin(5.5, 5.5, 22, 5.5))
+```
+
+```{r line-plot-legend, fig.width=4, fig.height=6}
+# colors
+tab20_colors <- c(
+  '#1f77b4', '#aec7e8', '#ff7f0e', '#ffbb78', '#2ca02c',
+  '#98df8a', '#d62728', '#ff9896', '#9467bd', '#c5b0d5',
+  '#8c564b', '#c49c94', '#e377c2', '#f7b6d2',
+ # '#7f7f7f', '#c7c7c7',
+  '#bcbd22', '#dbdb8d', '#17becf', '#9edae5'
+)
+
+# order genes by bin-4 lfc (enriched first) so the legend reads top-to-bottom in
+# the same order as the rows of the tick panel
+gene_levels <- bin4_lfc %>%
+  filter(gene %in% plot_genes) %>%
+  arrange(desc(lfc4)) %>%
+  pull(gene)
+gene_pal <- setNames(tab20_colors[seq_along(gene_levels)], gene_levels)
+
+top_long <- gata3_test %>%
+  filter(gene %in% plot_genes) %>%
+  mutate(gene = factor(gene, levels = gene_levels))
+
+p_dose <- top_long %>%
+  ggplot(aes(bin, lfc, group = gene, color = gene)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey60") +
+  geom_line(linewidth = 0.7, alpha = 0.85) +
+  geom_point(size = 3) +
+  scale_color_manual(values = gene_pal, name = NULL) +
+  scale_x_continuous(breaks = 1:4,
+                     labels = c("bin 1\n(low)", "bin 2", "bin 3", "bin 4\n(high)")) +
+  labs(x = "GATA3 reporter bin", y = "gene LFC (vs bin 1)")
+```
+
+```{r combine-legend, fig.height=5, fig.width=8}
+stacked <- (p_top / p_bottom) + plot_layout(heights = c(0.5, 3))
+(stacked | p_dose) + plot_layout(widths = c(1, 0.4))
+
+ggsave(file.path(outs_dir, "crispr_screen_tgfb_tnf_gata3/gata3_4_vs_1_sgRNA_lfc_density_dose_test.pdf"))
+```
+
+```{r line-plot-nolegend, fig.width=4, fig.height=6}
+# colors
+tab20_colors <- c(
+  '#1f77b4', '#aec7e8', '#ff7f0e', '#ffbb78', '#2ca02c',
+  '#98df8a', '#d62728', '#ff9896', '#9467bd', '#c5b0d5',
+  '#8c564b', '#c49c94', '#e377c2', '#f7b6d2',
+ # '#7f7f7f', '#c7c7c7',
+  '#bcbd22', '#dbdb8d', '#17becf', '#9edae5'
+)
+
+gene_levels <- bin4_lfc %>%
+  filter(gene %in% plot_genes) %>%
+  arrange(desc(lfc4)) %>%
+  pull(gene)
+gene_pal <- setNames(tab20_colors[seq_along(gene_levels)], gene_levels)
+
+top_long <- gata3_test %>%
+  filter(gene %in% plot_genes) %>%
+  mutate(gene = factor(gene, levels = gene_levels))
+
+p_dose <- top_long %>%
+  ggplot(aes(bin, lfc, group = gene, color = gene)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey60") +
+  geom_line(linewidth = 0.7, alpha = 0.85) +
+  geom_point(size = 3) +
+  scale_color_manual(values = gene_pal, guide = "none") +
+  scale_x_continuous(breaks = 1:4,
+                     labels = c("bin 1\n(low)", "bin 2", "bin 3", "bin 4\n(high)")) +
+  labs(x = "GATA3 reporter bin", y = "gene LFC (vs bin 1)")
+```
+
+```{r combine-nolegend, fig.height=5, fig.width=8}
+stacked <- (p_top / p_bottom) + plot_layout(heights = c(0.5, 3))
+(stacked | p_dose) + plot_layout(widths = c(1, 0.6))
+
+ggsave(file.path(outs_dir, "crispr_screen_tgfb_tnf_gata3/gata3_4_vs_1_sgRNA_lfc_density_dose_noLegend_test.pdf"),
+       width = 10, height = 5)
+```

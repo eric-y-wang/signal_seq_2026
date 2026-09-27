@@ -1,0 +1,740 @@
+---
+title: "sPCA specific program visualization"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup}
+library(tidyverse)
+library(patchwork)
+library(viridisLite)
+library(ggrepel)
+library(ComplexHeatmap)
+library(circlize)
+library(RColorBrewer)
+library(ggpointdensity)
+library(scales)
+library(viridisLite)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Repo-relative paths (inputs: imports_stable/, outputs: analysis_outs/)
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "02_combinatorial_screen_signalseq_SIG13")
+dir.create(file.path(outs_dir, "plots"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(outs_dir, "spca"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(outs_dir, "plots/spca_gene_hm"), recursive = TRUE, showWarnings = FALSE)
+source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
+theme_set(theme_Publication())
+interaction_palette <- c("#808080",brewer.pal(5,"Dark2"))
+names(interaction_palette) <- c("none", "additive over saturation", "buffering", 
+                      "buffering complete", "synergy negative", "synergy positive")
+```
+
+# Goal
+
+Visualize select annotated sparse PCA components for SIG13
+
+# Import
+
+```{r}
+# import feature scores
+features <- readr::read_csv(file.path(imports_dir, "SIG13/analysis_outs/spca/degs_zscore_allLigands/zscore_degs_allLigands_0.1_alpha1.0_sPCA_components.csv"))
+colnames(features)[-1] <- paste0("comp_",colnames(features)[-1])
+
+# import ligand component values
+codes <- readr::read_csv(file.path(imports_dir, "SIG13/analysis_outs/spca/degs_zscore_allLigands/zscore_degs_allLigands_0.1_alpha1.0_waggr_score.csv")) 
+codes <- codes %>%
+  dplyr::mutate(replicate = str_extract(interaction, "rep[12]"))
+
+# import lm results
+lm_scored <- read_csv(file.path(imports_dir, "SIG13/analysis_outs/spca/lm_scored_zscore_degs_allLigands_0.1_alpha1.0_sPCA_clean.csv"))
+lm_interaction <- read_csv(file.path(imports_dir, "SIG13/analysis_outs/spca/lm_fit_zscore_degs_allLigands_0.1_alpha1.0_sPCA.csv"))
+
+# define replicate-driven comps
+bad_rep_comps <- lm_interaction$component[!(lm_interaction$component %in% lm_scored$component)] %>% unique()
+```
+
+# Component Gene Numbers
+
+```{r, fig.height=4, fig.width=12}
+compNum <- features[,-1]
+compNum <- tibble(components = names(compNum),
+                  counts = colSums(compNum != 0))
+ggplot(compNum, aes(x = components, y = counts)) +
+  geom_col() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+```
+
+# Visualize interaction effects
+
+```{r, fig.height=10, fig.width=8}
+lm_scored %>%
+  filter(p_adj_interaction < 0.1 | p_adj_ligand1 < 0.1 | p_adj_ligand2 < 0.1) %>%
+  mutate(interaction_class = factor(interaction_class, levels = names(interaction_palette))) %>%
+  count(component, interaction_class, name = "n") %>%
+  group_by(component) %>%
+  mutate(freq = n / sum(n)) %>%
+  ungroup() %>%
+  filter(interaction_class != "none") %>%
+  ggplot(aes(x = n, y = component, fill = interaction_class)) +
+  geom_col() +
+  scale_fill_manual(values = interaction_palette, breaks = names(interaction_palette))
+```
+
+# Heatmap Subsets
+
+```{r}
+lm_interaction_res <- lm_interaction %>%
+  filter(component %in% lm_scored$component) %>% # remove replicate associated comps
+  filter(grepl("^ligand1.*:ligand2.*$", term)) %>%
+  mutate(term = gsub("ligand[12]","",term)) %>%
+  mutate(term = gsub(":","_",term)) %>%
+  mutate(p_score = -log10(p_adj)) %>%
+  rename(interaction = term)
+
+lm_single_res <- lm_interaction %>%
+  filter(component %in% lm_scored$component) %>% # remove replicate associated comps
+  filter(!grepl("^ligand1.*:ligand2.*$", term)) %>%
+  filter(grepl("ligand",term)) %>%
+  mutate(p_score = -log10(p_adj))
+
+codesMean <- codes %>%
+      dplyr::mutate(interaction = gsub("_rep[12]","",interaction)) %>%
+      group_by(interaction) %>%
+      summarise(across(where(is.numeric), ~ mean(.x, na.rm = TRUE)))
+```
+
+# Combination Single
+
+```{r, fig.width=12, fig.height=4}
+df <- codes %>%
+  dplyr::select(-any_of(bad_rep_comps)) %>%
+  mutate(interaction = gsub("_rep[12]", "", interaction)) %>%
+  group_by(interaction) %>%
+  summarise(across(where(is.numeric), ~mean(.x, na.rm = TRUE)), .groups = "drop") %>%
+  mutate(across(where(is.numeric), ~as.numeric(scale(.x)))) %>%
+  pivot_longer(-interaction, names_to = "component", values_to = "scaled_score") %>%
+  mutate(is_single = ifelse(grepl("linker", interaction),"yes","no")) %>%
+  left_join(lm_scored, by = c("interaction", "component")) %>%
+  mutate(filter_col = case_when(is_single == "no" & interaction_class == "none" ~ "remove",
+                                TRUE ~ "keep")) %>%
+  #filter(filter_col != "remove") %>%
+  group_by(component, is_single) %>%
+  slice_max(order_by = scaled_score, n=3) %>%
+  # Calculate difference (yes - no) and reorder component factor
+  group_by(component) %>%
+  mutate(diff_val = mean(scaled_score[is_single == "yes"]) - mean(scaled_score[is_single == "no"])) %>%
+  ungroup() %>%
+  mutate(component = reorder(component, diff_val))
+
+single_v_comb_plot <- df %>%
+  ggplot(aes(x = component, y = scaled_score, color = is_single)) +
+  geom_point(alpha=0.5) +
+  scale_color_manual(values = c("red","black")) +
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.5)) +
+  ggtitle("Distribution scaled sPCA score for top 3 conditions\nsingle vs combinatorial")
+single_v_comb_plot
+```
+
+```{r}
+ggsave(file.path(outs_dir, "plots/spca_alpha1.0_single_v_comb_plot.pdf"), single_v_comb_plot, width = 12, height = 4)
+write_csv(df, file.path(outs_dir, "spca/zscore_degs_allLigands_0.1_alpha1.0_sPCA_single_comb_top3.csv"))
+```
+
+# sPCA HM Visualization
+
+## Full Heatmap
+
+```{r, fig.height=10, fig.width=10}
+# scale and clean codes
+mat <- codes %>%
+  dplyr::select(-any_of(bad_rep_comps))  %>%
+  dplyr::mutate(interaction = gsub("_rep[12]","",interaction)) %>%
+  group_by(interaction) %>%
+  summarise(across(where(is.numeric), ~ mean(.x, na.rm = TRUE))) %>%
+  dplyr::mutate(across(where(is.numeric), ~ as.numeric(scale(.x, center=F)))) %>%
+  column_to_rownames("interaction") %>%
+  as.matrix()
+
+# extract ligand1 from rownames (before transposing!)
+interaction_names <- rownames(mat)
+ligand1_vec <- sapply(strsplit(interaction_names, "_"), `[`, 1)
+
+# build column annotation (applies to columns *after* transpose)
+col_anno <- HeatmapAnnotation(
+  ligand1 = ligand1_vec,
+  col = list(ligand1 = setNames(brewer.pal(length(unique(ligand1_vec)), "Set3"), unique(ligand1_vec)))
+)
+
+# transpose
+mat <- t(mat)
+
+col_fun <- colorRamp2(
+  seq(-6, 6, length.out = 11),
+  rev(brewer.pal(n = 11, name = "RdBu"))
+)
+
+# Plot
+hm_full <- Heatmap(
+  mat,
+  name = "scaled sPCA loadings",
+  col = col_fun,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_row_names = TRUE,
+  show_column_names = FALSE,
+  top_annotation = col_anno,
+  column_title = "sPCA components across interactions\nmean across replicates",
+  heatmap_legend_param = list(
+    title = "scaled sPCA\nloadings",
+    at = seq(-5, 5, by = 3),
+    color_bar = "continuous"
+  )
+)
+draw(hm_full)
+```
+
+## Single Ligands + Interaction Bar Plots
+
+```{r, fig.height=12, fig.width=9}
+class_levels <- setdiff(names(interaction_palette), "none")
+
+# pull out significant ligands
+sig_ligands <- {
+  x <- lm_single_res %>% filter(p_adj < 0.05) %>% pull(term) %>% unique()
+  x <- sub("^ligand1(.+)$", "\\1_linker", x)
+  sub("^ligand2(.+)$", "linker_\\1", x)
+}
+sig_ligands <- sig_ligands[!(sig_ligands %in% c("linker_TNF","linker_IL2","linker_IL6","linker_IL27","linker_IL4","linker_IL21","linker_IFNG","linker_IL7"))]
+
+# make heatmap matrix
+mat <- codes %>%
+  dplyr::select(-any_of(bad_rep_comps)) %>%
+  mutate(interaction = gsub("_rep[12]", "", interaction)) %>%
+  group_by(interaction) %>%
+  summarise(across(where(is.numeric), ~mean(.x, na.rm = TRUE)), .groups = "drop") %>%
+  # scale before filtering for single ligands
+  mutate(across(where(is.numeric), ~as.numeric(scale(.x)))) %>%
+  filter(interaction %in% sig_ligands) %>%
+  mutate(interaction = gsub("^linker_|_linker","",interaction)) %>%
+  column_to_rownames("interaction") %>% as.matrix() %>% t()
+
+# make heatmap color scale
+col_fun <- colorRamp2(seq(-6, 6, length.out = 11), rev(brewer.pal(11, "RdBu")))
+
+# make bar plot
+bar_mat <- lm_scored %>%
+  filter(p_adj_interaction < 0.05 | p_adj_ligand1 < 0.05 | p_adj_ligand2 < 0.05) %>%
+  filter(interaction_class != "buffering") %>%
+  #filter(interaction_class %in% class_levels) %>%
+  mutate(interaction_class = factor(interaction_class, levels = class_levels)) %>%
+  count(component, interaction_class, name = "n") %>%
+  complete(component, interaction_class, fill = list(n = 0)) %>%
+  pivot_wider(names_from = interaction_class, values_from = n, names_expand = TRUE, values_fill = 0) %>%
+  column_to_rownames("component") %>% as.matrix()
+
+common <- intersect(rownames(mat), rownames(bar_mat))
+mat <- mat[common, , drop = FALSE]
+bar_mat <- bar_mat[common, class_levels, drop = FALSE]
+
+ht <- Heatmap(mat, name = "scaled sPCA loadings",
+              col = col_fun,
+              cluster_rows = TRUE, cluster_columns = TRUE,
+              row_names_side = "left",
+              border_gp = gpar(col = "black"),
+              heatmap_legend_param = list(title = "scaled\nsPCA\nloadings",
+                                          at = seq(-6, 6, by = 3), color_bar = "continuous"))
+
+bars <- rowAnnotation(
+  num_interactions = anno_barplot(bar_mat, gp = gpar(fill = interaction_palette[class_levels]),
+                       axis_param = list(side = "bottom")),
+  width = unit(45, "mm")
+)
+
+bar_legend <- Legend(title = "interaction class", at = class_levels,
+                     legend_gp = gpar(fill = interaction_palette[class_levels]))
+
+# Assign the draw result to an object
+ht_obj <- draw(ht + bars, annotation_legend_list = list(bar_legend),
+      heatmap_legend_side = "right", annotation_legend_side = "right")
+
+# Extract the components in their clustered order
+clustered_rows <- tibble(component = rownames(mat)[row_order(ht_obj)])
+```
+
+## Consistent Ligands + Interactions Bar
+
+`consistent_ligands` is the repo-wide reproducibility filter used elsewhere in this repo (e.g.
+`analysis/qc_barcode_counts/02_glm_coefficient_concordance_viz.Rmd`): ligand-pair combos whose
+interaction LFCs correlate across biological replicates.
+
+```{r}
+repCor <- readr::read_csv(file.path(imports_dir, "SIG13/analysis_outs/replicate_corr/replicate_correlation_interactionLfc_0.2filter.csv"))
+
+consistent_ligands <- repCor %>%
+  filter(pearson_corr > 0.25 & num_shared_genes > 1) %>%
+  pull(interaction)
+
+length(consistent_ligands)
+```
+
+```{r, fig.height=12, fig.width=10}
+# scale and clean codes, restricted to reproducible interactions
+mat <- codes %>%
+  dplyr::select(-any_of(bad_rep_comps))  %>%
+  dplyr::mutate(interaction = gsub("_rep[12]","",interaction)) %>%
+  filter(interaction %in% consistent_ligands) %>%
+  group_by(interaction) %>%
+  summarise(across(where(is.numeric), ~ mean(.x, na.rm = TRUE))) %>%
+  dplyr::mutate(across(where(is.numeric), ~ as.numeric(scale(.x, center=F)))) %>%
+  column_to_rownames("interaction") %>%
+  as.matrix()
+
+# extract ligand1 from rownames (before transposing!)
+interaction_names <- rownames(mat)
+ligand1_vec <- sapply(strsplit(interaction_names, "_"), `[`, 1)
+
+# build column annotation (applies to columns *after* transpose)
+col_anno <- HeatmapAnnotation(
+  ligand1 = ligand1_vec,
+  col = list(ligand1 = setNames(brewer.pal(length(unique(ligand1_vec)), "Set3"), unique(ligand1_vec)))
+)
+
+# transpose
+mat <- t(mat)
+
+col_fun <- colorRamp2(
+  seq(-4, 4, length.out = 11),
+  rev(brewer.pal(n = 11, name = "RdBu"))
+)
+
+# make bar plot of synergistic interaction class counts, restricted to reproducible interactions
+bar_mat_reproducible <- lm_scored %>%
+  filter(interaction %in% consistent_ligands) %>%
+  filter(p_adj_interaction < 0.1 | p_adj_ligand1 < 0.1 | p_adj_ligand2 < 0.1) %>%
+  filter(interaction_class != "buffering") %>%
+  mutate(interaction_class = factor(interaction_class, levels = class_levels)) %>%
+  count(component, interaction_class, name = "n") %>%
+  complete(component, interaction_class, fill = list(n = 0)) %>%
+  pivot_wider(names_from = interaction_class, values_from = n, names_expand = TRUE, values_fill = 0) %>%
+  column_to_rownames("component") %>% as.matrix()
+
+common <- intersect(rownames(mat), rownames(bar_mat_reproducible))
+mat <- mat[common, , drop = FALSE]
+bar_mat_reproducible <- bar_mat_reproducible[common, class_levels, drop = FALSE]
+
+bars_reproducible <- rowAnnotation(
+  num_interactions = anno_barplot(bar_mat_reproducible, gp = gpar(fill = interaction_palette[class_levels]),
+                       axis_param = list(side = "bottom")),
+  width = unit(45, "mm")
+)
+
+# Plot
+hm_full_reproducible <- Heatmap(
+  mat,
+  name = "scaled sPCA loadings",
+  col = col_fun,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_row_names = TRUE,
+  row_names_side = "left",
+  show_column_names = FALSE,
+  top_annotation = col_anno,
+  border_gp = gpar(col = "black"),
+  column_title = "sPCA components across reproducible interactions\nmean across replicates",
+  heatmap_legend_param = list(
+    title = "scaled sPCA\nloadings",
+    at = seq(-4, 4, by = 2),
+    color_bar = "continuous"
+  )
+)
+ht_obj_reproducible <- draw(hm_full_reproducible + bars_reproducible, annotation_legend_list = list(bar_legend),
+     heatmap_legend_side = "right", annotation_legend_side = "right")
+```
+
+## Combined Single + Consistent Ligand Heatmap
+
+Combines the single-ligand heatmap (left, with column labels), the consistent
+(reproducible) interaction heatmap (middle, no column labels since there are
+many combos), and the interaction-effect bar plot (right), restricted to the
+components shared across all three panels.
+
+```{r, fig.height=12, fig.width=20}
+# single-ligand matrix: components (rows) x single ligands (columns, labeled)
+mat_single <- codes %>%
+  dplyr::select(-any_of(bad_rep_comps)) %>%
+  mutate(interaction = gsub("_rep[12]", "", interaction)) %>%
+  group_by(interaction) %>%
+  summarise(across(where(is.numeric), ~mean(.x, na.rm = TRUE)), .groups = "drop") %>%
+  mutate(across(where(is.numeric), ~as.numeric(scale(.x)))) %>%
+  filter(interaction %in% sig_ligands) %>%
+  mutate(interaction = gsub("^linker_|_linker","",interaction)) %>%
+  column_to_rownames("interaction") %>% as.matrix() %>% t()
+
+# consistent-ligand matrix: components (rows) x reproducible interactions (columns, unlabeled)
+mat_consistent <- codes %>%
+  dplyr::select(-any_of(bad_rep_comps)) %>%
+  dplyr::mutate(interaction = gsub("_rep[12]","",interaction)) %>%
+  filter(interaction %in% consistent_ligands) %>%
+  group_by(interaction) %>%
+  summarise(across(where(is.numeric), ~ mean(.x, na.rm = TRUE)))
+
+mat_consistent <- mat_consistent %>%
+  dplyr::mutate(across(where(is.numeric), ~ as.numeric(scale(.x, center = FALSE)))) %>%
+  column_to_rownames("interaction") %>%
+  as.matrix() %>% t()
+
+# restrict all three panels to components shared across the single-ligand
+# heatmap, the consistent-ligand heatmap, and the reproducible interaction-effect bar plot
+common_combined <- Reduce(intersect, list(rownames(mat_single), rownames(mat_consistent), rownames(bar_mat_reproducible)))
+
+mat_single_c <- mat_single[common_combined, , drop = FALSE]
+mat_consistent_c <- mat_consistent[common_combined, , drop = FALSE]
+bar_mat_combined <- bar_mat_reproducible[common_combined, class_levels, drop = FALSE]
+
+col_fun_single <- colorRamp2(seq(-4, 4, length.out = 11), rev(brewer.pal(11, "RdBu")))
+col_fun_consistent <- colorRamp2(seq(-4, 4, length.out = 11), rev(brewer.pal(11, "RdBu")))
+
+ht_consistent_combined <- Heatmap(
+  mat_consistent_c,
+  name = "consistent interaction\nscaled sPCA loadings",
+  col = col_fun_consistent,
+  cluster_rows = TRUE, 
+  cluster_columns = TRUE,
+  show_row_names = TRUE,
+  row_names_side = "left",
+  show_column_names = FALSE,
+  border_gp = gpar(col = "black"),
+  column_title = "consistent interactions",
+  heatmap_legend_param = list(title = "consistent\nscaled sPCA\nloadings", at = seq(-4, 4, by = 2), color_bar = "continuous")
+)
+
+ht_single_combined <- Heatmap(
+  mat_single_c,
+  name = "single ligand\nscaled sPCA loadings",
+  col = col_fun_single,
+  cluster_rows = FALSE, # follow row order from ht_consistent_combined's clustering
+  cluster_columns = TRUE,
+  show_row_names = FALSE,
+  show_column_names = TRUE,
+  border_gp = gpar(col = "black"),
+  column_title = "single ligands",
+  heatmap_legend_param = list(title = "single ligand\nscaled sPCA\nloadings", at = seq(-4, 4, by = 2), color_bar = "continuous")
+)
+
+bars_combined <- rowAnnotation(
+  num_interactions = anno_barplot(bar_mat_combined, gp = gpar(fill = interaction_palette[class_levels]),
+                       axis_param = list(side = "bottom")),
+  width = unit(45, "mm")
+)
+
+draw(ht_consistent_combined + ht_single_combined + bars_combined,
+     annotation_legend_list = list(bar_legend),
+     heatmap_legend_side = "right", annotation_legend_side = "right")
+
+# extract the components in their clustered order
+clustered_rows_reproducible <- tibble(component = rownames(mat_consistent)[row_order(ht_consistent_combined)])
+```
+
+## Export
+
+```{r}
+pdf(file.path(outs_dir, "plots/spca_alpha1.0_singleLigand_interactions_hm.pdf"), width = 9, height = 12)
+draw(ht + bars, annotation_legend_list = list(bar_legend),
+     heatmap_legend_side = "right", annotation_legend_side = "right")
+dev.off()
+```
+
+```{r}
+pdf(file.path(outs_dir, "plots/spca_alpha1.0_full_hm.pdf"), width = 10, height = 8)
+draw(hm_full)
+dev.off()
+```
+
+```{r}
+pdf(file.path(outs_dir, "plots/spca_alpha1.0_full_hm_reproducible.pdf"), width = 10, height = 12)
+draw(hm_full_reproducible + bars_reproducible, annotation_legend_list = list(bar_legend),
+     heatmap_legend_side = "right", annotation_legend_side = "right")
+dev.off()
+```
+
+```{r}
+pdf(file.path(outs_dir, "plots/spca_alpha1.0_single_consistent_combined_hm.pdf"), width = 20, height = 12)
+draw(ht_consistent_combined + ht_single_combined + bars_combined,
+     annotation_legend_list = list(bar_legend),
+     heatmap_legend_side = "right", annotation_legend_side = "right")
+dev.off()
+```
+
+```{r}
+write_csv(clustered_rows, file.path(outs_dir, "spca/spca_alpha1.0_full_hm_row_order.csv"))
+write_csv(clustered_rows_reproducible, file.path(outs_dir, "spca/spca_alpha1.0_full_hm_reproducible_row_order.csv"))
+```
+
+# TNF Interaction Heatmaps
+
+## Define Synergy Comps
+
+```{r}
+synergy_pos_comps <- lm_scored %>%
+  filter(interaction_class == "synergy positive") %>%
+  filter(`freq_synergy positive` > 0.05) %>%
+  filter(p_adj_interaction < 0.001) %>%
+  group_by(interaction) %>%
+  slice_min(order_by = p_adj_interaction, n = 1)
+```
+
+## Visualize
+
+```{r, fig.width=12, fig.height=3.5}
+# Define the specific order for the categories
+cat_levels <- c("IL2_TNF", "IL4_TNF", "IL7_TNF", "IL6_TNF", "IL21_TNF", 
+                "IL27_TNF", "IFNG_TNF", "TGFB1_TNF", "TNF_TNF", "single")
+
+# subset and apply factor order
+pattern <- "^(IL2|IL4|IL6|IL7|IL21|IL27|TGFB1|IFNG|TNF)_(TNF.*|linker)|^linker_TNF.*"
+
+# define comps
+comps <- synergy_pos_comps %>%
+  filter(grepl("^(IL2|IL4|IL6|IL7|IL21|IL27|TGFB1|IFNG|TNF)_(TNF.*)", interaction)) %>%
+  filter(!grepl("TNF_TNF.*", interaction)) %>%
+  pull(component) %>%
+  unique()
+
+# Prepare data
+mat_prep <- codesMean %>%
+  filter(!grepl("TNFSF9|TNFSF14", interaction)) %>%
+  filter(grepl(pattern, interaction)) %>%
+  dplyr::select(interaction, all_of(comps)) %>%
+  column_to_rownames("interaction") %>%
+  scale() %>%
+  as.data.frame()
+
+# Create category vector ensuring it is a FACTOR with the specific levels
+categories <- factor(case_when(
+  grepl("linker", rownames(mat_prep)) ~ "single",
+  TRUE ~ sub("^([^_]+)_TNF.*", "\\1_TNF", rownames(mat_prep))
+), levels = cat_levels)
+
+# Define Tab10 colors manually
+tab10_colors <- c("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", 
+                  "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf")
+
+# Map colors to categories
+cat_colors <- setNames(tab10_colors[1:length(levels(categories))], levels(categories))
+
+# Create annotation
+ha <- HeatmapAnnotation(
+  Category = categories,
+  col = list(Category = cat_colors)
+)
+
+# Transpose
+mat <- t(as.matrix(mat_prep))
+
+# Color function
+col_fun <- colorRamp2(seq(-3.5, 3.5, length.out = 11), rev(brewer.pal(n = 11, name = "RdBu")))
+
+# Plot with cluster_column_slices = FALSE to respect factor order
+ht_tnf <- Heatmap(
+  mat,
+  name = "scaled sPCA score",
+  col = col_fun,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_row_dend = FALSE,
+  show_column_dend = FALSE,
+  top_annotation = ha,
+  column_split = categories,
+  cluster_column_slices = FALSE, # This enforces the factor level order
+  column_title = "TNF family sPCA synergy components",
+  heatmap_legend_param = list(title = "scaled sPCA\nscore",
+                              at = seq(-4,4,2),
+                              border="black")
+)
+ht_tnf
+```
+
+```{r}
+pdf(file.path(outs_dir, "plots/spca_tnf_family_interaction_programs.pdf"), width = 12, height = 3.5)
+draw(ht_tnf)
+dev.off()
+```
+
+# Visualize Gene Programs
+
+```{r}
+# import python interpreters
+library(reticulate)
+reticulate::use_condaenv("R-deseq2", conda = "auto", required = TRUE)
+library(anndata)
+
+rna <- read_h5ad(file.path(imports_dir, "SIG13/scanpy_outs/SIG13_doublets_DSB7_zscore_degs0.1cutoff_pb.h5ad"))
+obs <- rna$obs %>%
+  as_tibble(rownames = "cell_bc")
+
+# make expression tibble
+expTib <- rna$X %>%
+  as.matrix() %>%
+  as_tibble(rownames = "cell_bc") %>%
+  left_join(obs) %>%
+  rename(interaction = ligand_call_DSB7)
+```
+
+## Helper Functions
+
+```{r}
+plot_component_heatmap_simple <- function(pattern, comp, n_genes, features, expTib,
+                                          average_replicates = FALSE,
+                                          scale_expression = TRUE,
+                                          vmin = -2, vmax = 2) {
+  # 1. Get Top Genes
+  compGenes <- features %>%
+    slice_max(order_by = !!sym(comp), n = n_genes) %>%
+    pull(gene)
+
+  # 2. Filter and Prepare Data
+  exp_sub <- expTib %>%
+    filter(interaction %in% pattern) %>%
+    select(interaction, any_of(compGenes)) %>%
+    mutate(interaction = factor(interaction, levels = pattern)) %>%
+    arrange(interaction)
+
+  if (average_replicates) {
+    exp_sub <- exp_sub %>%
+      group_by(interaction) %>%
+      summarise(across(where(is.numeric), mean))
+  }
+
+  # 3. Create Matrix and Scale
+  mat <- as.matrix(select(exp_sub, -interaction))
+  if (scale_expression) mat <- scale(mat)
+
+  # 4. Annotations and Colors
+  # Uses Dark2 for interaction bars
+  inter_cols <- setNames(RColorBrewer::brewer.pal(8, "Dark2")[1:length(pattern)], pattern)
+  row_ha <- rowAnnotation(interaction = exp_sub$interaction, col = list(interaction = inter_cols))
+  #col_fun <- colorRamp2(seq(vmin, vmax, length.out = 9), rev(brewer.pal(9,"RdBu")))
+  col_fun <- colorRamp2(seq(vmin, vmax, length.out = 100), magma(100))
+
+  # 5. Plot
+  Heatmap(mat,
+    name = "Expression",
+    col = col_fun,
+    left_annotation = row_ha,
+    cluster_rows = FALSE,
+    cluster_columns = TRUE,
+    show_row_names = average_replicates,
+    column_title = comp
+  )
+}
+```
+
+## Visualization
+
+```{r}
+# renders a heatmap once and saves the same object to both the notebook and a PDF,
+# instead of calling plot_component_heatmap_simple twice with duplicated arguments
+save_component_heatmap <- function(file, width, height, ...) {
+  ht <- plot_component_heatmap_simple(...)
+  print(ht)
+  pdf(file, width = width, height = height)
+  draw(ht)
+  dev.off()
+}
+```
+
+```{r, fig.height=4, fig.width=3}
+save_component_heatmap(
+  file = file.path(outs_dir, "plots/spca_gene_hm/comp_50_IL4_TNF.pdf"), width = 3, height = 4,
+  pattern = c("IL4_TNF","IL4_linker","TNF_linker","linker_linker"),
+  comp = "comp_50", n_genes = 20, features = features, expTib = expTib,
+  average_replicates = F, scale_expression = F, vmin = 0, vmax = 6
+)
+```
+
+```{r, fig.height=4, fig.width=3}
+save_component_heatmap(
+  file = file.path(outs_dir, "plots/spca_gene_hm/comp_31_IL2_IL4_TNFSF18.pdf"), width = 3, height = 4,
+  pattern = c("IL2_TNFSF18","IL4_TNFSF18","IL2_IL4","IL2_linker","IL4_linker","linker_TNFSF18","linker_linker"),
+  comp = "comp_31", n_genes = 20, features = features, expTib = expTib,
+  average_replicates = F, scale_expression = F, vmin = 0, vmax = 4
+)
+```
+
+```{r, fig.height=4, fig.width=3}
+save_component_heatmap(
+  file = file.path(outs_dir, "plots/spca_gene_hm/comp_26_IFNG_IL27_IFNB1.pdf"), width = 3, height = 4,
+  pattern = c("IL27_IFNB1","IL27_IFNG","IL27_linker","linker_IFNG","linker_linker"),
+  comp = "comp_26", n_genes = 20, features = features, expTib = expTib,
+  average_replicates = F, scale_expression = F, vmin = 0, vmax = 8
+)
+```
+
+```{r, fig.height=4, fig.width=3}
+# NOTE: the on-screen plot and the exported PDF intentionally differ here (n_genes = 20 vs 15),
+# matching the pre-existing behavior of this chunk before cleanup
+plot_component_heatmap_simple(pattern = c("IFNG_TNF","IL27_TNF","IFNG_IL27","IFNG_linker","linker_IL27","linker_TNF","linker_linker"),
+                       comp = "comp_16",
+                       n_genes = 20,
+                       features = features,
+                       expTib = expTib,
+                       average_replicates = F,
+                       scale_expression = F,
+                       vmin=0, vmax=3)
+
+pdf(file.path(outs_dir, "plots/spca_gene_hm/comp_16_IFNG_IL27_TNF.pdf"), width = 3, height = 4)
+plot_component_heatmap_simple(pattern = c("IFNG_TNF","IL27_TNF","IFNG_IL27","IFNG_linker","linker_IL27","linker_TNF","linker_linker"),
+                       comp = "comp_16",
+                       n_genes = 15,
+                       features = features,
+                       expTib = expTib,
+                       average_replicates = F,
+                       scale_expression = F,
+                       vmin=0, vmax=3)
+dev.off()
+```
+
+```{r, fig.height=4, fig.width=3}
+save_component_heatmap(
+  file = file.path(outs_dir, "plots/spca_gene_hm/comp_4_IL6_IL2.pdf"), width = 3, height = 4,
+  pattern = c("IL6_IL2","IL6_linker","linker_IL2","linker_linker"),
+  comp = "comp_4", n_genes = 20, features = features, expTib = expTib,
+  average_replicates = F, scale_expression = F, vmin = 0, vmax = 4
+)
+```
+
+```{r, fig.height=4, fig.width=3.5}
+save_component_heatmap(
+  file = file.path(outs_dir, "plots/spca_gene_hm/comp_31_IL21_CCL19_21A.pdf"), width = 3, height = 4.5,
+  pattern = c("IL2_linker","IL21_CCL19","IL21_CCL21A","IL21_linker","linker_CCL19","linker_CCL21A","linker_linker"),
+  comp = "comp_31", n_genes = 20, features = features, expTib = expTib,
+  average_replicates = F, scale_expression = F, vmin = 0, vmax = 4
+)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+

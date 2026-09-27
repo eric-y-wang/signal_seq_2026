@@ -1,0 +1,244 @@
+---
+title: "spca_score_concordance_comparison"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup}
+library(tidyverse)
+library(patchwork)
+library(viridisLite)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Repo-relative paths: inputs are read from imports_stable/, outputs are written to analysis_outs/
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find the repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "02_combinatorial_screen_signalseq_SIG13")
+source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
+theme_set(theme_Publication())
+
+plot_dir <- file.path(outs_dir, "plots/qc_barcode_counts")
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Goal
+
+Are sPCA component scores associated with barcode UMI depth?
+`03_spca_waggr_countSubset_scoring.ipynb` re-ran the production `waggr` scoring on the top 30%,
+bottom 30%, and a score-agnostic random 30% of cells (by mean barcode score, within each
+`ligand_call_DSB7 x replicate` pseudobulk unit), plus the full population. All three subsets are
+matched in size by construction, and `random30` shows what a 30% subset looks like with no depth
+selection.
+
+# Import
+
+```{r}
+scores <- read_csv(file.path(imports_dir, "SIG13/analysis_outs/qc_barcode_counts/spca_waggr_countSubset_scores_long.csv.gz"),
+                   show_col_types = FALSE)
+qc <- read_csv(file.path(imports_dir, "SIG13/analysis_outs/qc_barcode_counts/spca_waggr_countSubset_qc.csv"),
+               show_col_types = FALSE)
+
+comp_levels <- scores %>%
+  distinct(component) %>%
+  mutate(idx = as.integer(str_remove(component, "comp_"))) %>%
+  arrange(idx) %>%
+  pull(component)
+
+scores <- scores %>% mutate(component = factor(component, levels = comp_levels))
+
+scores %>% count(subset)
+```
+
+```{r}
+full_scores <- scores %>%
+  filter(subset == "full") %>%
+  select(unit_id, component, ligand_call_DSB7, replicate, score_full = score)
+
+# per-component SD across pseudobulk units, used to standardise the score shifts below
+comp_sd <- full_scores %>%
+  group_by(component) %>%
+  summarise(sd_full = sd(score_full), .groups = "drop")
+
+unit_meta <- scores %>% distinct(unit_id, ligand_call_DSB7, replicate)
+
+n_units <- n_distinct(full_scores$unit_id)
+n_comps <- n_distinct(full_scores$component)
+cat("pseudobulk units:", n_units, " components:", n_comps, "\n")
+```
+
+# Correlation of component scores
+
+Here, we are looking at the absolute score values of sPCA-derived GEP in cells with top30, bottom30, or random30 barcode counts compared to the full data scores. We examine correlation and plot of component scores across treatment samples compared to the full-data scores.
+
+```{r}
+# overall correlation to full
+scores %>%
+  filter(subset != "full") %>%
+  left_join(full_scores %>% select(unit_id, component, score_full),
+            by = c("unit_id", "component")) %>%
+  group_by(subset) %>%
+  summarise(pearson = cor(score, score_full),
+            spearman = cor(score, score_full, method = "spearman"),
+            .groups = "drop")
+```
+
+```{r fig.width=10, fig.height=5}
+p_conc <- scores %>%
+  filter(subset != "full") %>%
+  left_join(full_scores %>% select(unit_id, component, score_full),
+            by = c("unit_id", "component")) %>%
+  group_by(subset, unit_id) %>%
+  summarise(pearson = cor(score, score_full),
+            spearman = cor(score, score_full, method = "spearman"),
+            .groups = "drop") %>%
+  pivot_longer(c(pearson, spearman), names_to = "metric", values_to = "r") %>%
+  ggplot(aes(x = subset, y = r, colour = subset)) +
+  geom_boxplot() +
+  ylim(0, 1) +
+  facet_wrap(~metric) +
+  theme(aspect.ratio = 1) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(x = NULL, y = "correlation with full-data scores",
+       title = "Subset vs. full concordance (each point = one pseudobulk unit)\ncorrelation of component scores within treatment conditions")
+
+p_conc
+ggsave(file.path(plot_dir, "spca_score_correlation_boxplots.pdf"))
+```
+
+```{r fig.width=10, fig.height=5}
+p_scatter <- scores %>%
+  filter(subset != "full") %>%
+  left_join(full_scores %>% select(unit_id, component, score_full),
+            by = c("unit_id", "component")) %>%
+  ggplot(aes(x = score_full, y = score)) +
+  geom_point(size = 0.3, alpha = 0.2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "red") +
+  facet_wrap(~subset) +
+  theme(aspect.ratio = 1) +
+  labs(x = "full-data score", y = "subset score")
+
+p_scatter
+ggsave(file.path(plot_dir, "spca_score_correlation_scatterplot.pdf"))
+```
+
+# Association between GEP component score differences and total count differences
+
+Barcode UMI depth tracks library size, and this exact top30/bottom30 split leaves the top subset with a median **53% more total counts** and **28% more detected genes**. Here, we examine whether the two move together *per unit*: if the units with the largest `top30 - bottom30` score shift are also the units with the largest shift in `total_counts`, the association is plausibly library-size driven rather than barcode-calling driven.
+
+```{r}
+# function to pair values of different subsets
+paired_delta <- function(a, b) {
+  scores %>%
+    filter(subset %in% c(a, b)) %>%
+    mutate(side = if_else(subset == a, "score_a", "score_b")) %>%
+    select(unit_id, component, side, score) %>%
+    pivot_wider(names_from = side, values_from = score) %>%
+    mutate(delta = score_a - score_b)
+}
+```
+
+```{r}
+qc_delta <- qc %>%
+  mutate(unit_id = paste(ligand_call_DSB7, replicate, sep = "_")) %>%
+  # keep only the two subsets of interest
+  filter(subset %in% c("top30", "bottom30")) %>%
+  # pivot subset (top30/bottom30) out into separate columns per metric
+  pivot_wider(
+    id_cols = unit_id,
+    names_from = subset,
+    values_from = c(mean_total_counts, mean_n_genes, mean_barcode_score),
+    names_glue = "{.value}_{subset}"
+  ) %>%
+  mutate(
+    d_total_counts  = mean_total_counts_top30   - mean_total_counts_bottom30,
+    d_n_genes       = mean_n_genes_top30        - mean_n_genes_bottom30,
+    d_barcode_score = mean_barcode_score_top30  - mean_barcode_score_bottom30
+  ) %>%
+  # match column order shown in your example
+  select(
+    unit_id,
+    mean_total_counts_top30, mean_total_counts_bottom30,
+    mean_n_genes_top30, mean_n_genes_bottom30,
+    mean_barcode_score_top30, mean_barcode_score_bottom30,
+    d_total_counts, d_n_genes, d_barcode_score
+  )
+
+confound <- paired_delta("top30", "bottom30") %>%
+  inner_join(qc_delta, by = "unit_id") %>%
+  group_by(component) %>%
+  summarise(mean_delta = mean(delta),
+            r_counts = cor(delta, d_total_counts),
+            .groups = "drop")
+
+worst <- confound %>%
+  slice_max(r_counts, n = 4) %>%
+  pull(component)
+```
+
+
+```{r}
+# overall correlation between mean component score delta and pearson r of
+# score delta vs total counts delta
+confound %>%
+  ungroup() %>%
+  summarise(pearson = cor((mean_delta), r_counts),
+            spearman = cor(mean_delta, r_counts, method = "spearman"))
+
+# get pearson cor of worst components
+paired_delta("top30", "bottom30") %>%
+  inner_join(qc_delta, by = "unit_id") %>%
+  filter(component %in% worst) %>%
+  group_by(component) %>%
+  summarise(pearson = cor(delta, d_total_counts),
+            .groups = "drop")
+```
+
+```{r fig.width=10, fig.height=10}
+p_conf_hist <- confound %>%
+  ggplot(aes(x = r_counts)) +
+  geom_histogram(bins = 40) +
+  labs(x = "correlation across units:\nscore delta (top30 - bottom30)\nvs. total_counts delta",
+       y = "n components") +
+  theme(aspect.ratio = 1)
+
+p_overall <- paired_delta("top30", "bottom30") %>%
+  inner_join(qc_delta, by = "unit_id") %>%
+  group_by(component) %>%
+  summarise(mean_delta = mean(delta),
+            pearson = cor(delta, d_total_counts),
+            .groups = "drop") %>%
+  ggplot(aes(x = (mean_delta), y = pearson)) +
+  geom_point() +
+  xlab("top30 - bottom30\nmean component score delta\nper component") +
+  ylab("pearson r\nmean component score delta\nvs total_counts_delta") +
+  theme(aspect.ratio = 1)
+
+p_conf_scatter <- paired_delta("top30", "bottom30") %>%
+  inner_join(qc_delta, by = "unit_id") %>%
+  filter(component %in% worst) %>%
+  ggplot(aes(x = d_total_counts, y = delta)) +
+  geom_point(size = 1.2, alpha = 0.7) +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_wrap(~component, scales = "free_y", ncol = 4) +
+  labs(x = "top30 - bottom30\nmean total_counts (per unit)",
+       y = "top30 - bottom30\ncomponent score") +
+  theme(aspect.ratio = 1)
+
+(p_conf_hist+p_overall)/p_conf_scatter + plot_annotation(title = "RNA-depth association with component score differences\nin top and bottom30 barcode count cells")
+ggsave(file.path(plot_dir, "spca_score_concordance_rna_depth_confound.pdf"))
+```
+
+In the top plots, each point is a component and points are the average across all ligands. In the bottom plots each point is a ligand and the correlation of score 
+

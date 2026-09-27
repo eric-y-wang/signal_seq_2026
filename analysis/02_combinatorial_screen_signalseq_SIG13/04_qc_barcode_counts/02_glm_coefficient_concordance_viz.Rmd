@@ -1,0 +1,191 @@
+---
+title: "coefficient_concordance_viz"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup}
+library(tidyverse)
+library(patchwork)
+library(viridisLite)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Repo-relative paths: inputs are read from imports_stable/, outputs are written to analysis_outs/
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find the repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "02_combinatorial_screen_signalseq_SIG13")
+source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
+for (d in c("qc_barcode_counts", "plots/qc_barcode_counts")) dir.create(file.path(outs_dir, d), recursive = TRUE, showWarnings = FALSE)
+theme_set(theme_Publication())
+```
+
+# Import
+
+Full-dataset production GLM outputs (`05_interaction_scoring/glmGamPoi_interaction_slurm.r`), and
+the top30/bottom30/random30 count-subset equivalents from `01_glmGamPoi_interaction_countSubset_slurm.r`.
+
+```{r}
+full_singles <- read_csv(file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/glmGamPoi_interaction/glmGamPoi_singles_lfc_0.1filter.csv"))
+full_inter   <- read_csv(file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/glmGamPoi_interaction/glmGamPoi_interaction_lfc_0.1filter.csv"))
+
+load_subset <- function(count_subset) {
+  dir <- file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi", paste0("glmGamPoi_interaction_", count_subset, "count"))
+  list(
+    singles = read_csv(file.path(dir, "glmGamPoi_singles_lfc_0.1filter.csv")),
+    inter   = read_csv(file.path(dir, "glmGamPoi_interaction_lfc_0.1filter.csv"))
+  )
+}
+
+top30    <- load_subset("top30")
+bottom30 <- load_subset("bottom30")
+random30 <- load_subset("random30")
+```
+
+# Define Consistent Ligands
+
+`consistent_ligands` is the repo-wide reproducibility filter: ligand-pair combos whose interaction
+LFCs correlate across biological replicates.
+
+```{r}
+repCor <- read_csv(file.path(imports_dir, "SIG13/analysis_outs/replicate_corr/replicate_correlation_interactionLfc_0.2filter.csv"))
+
+consistent_ligands <- repCor %>%
+  filter(pearson_corr > 0.25 & num_shared_genes > 1) %>%
+  pull(interaction)
+
+length(consistent_ligands)
+```
+
+# Calculate Concordance
+
+For each ligand combo, correlate the per-gene log-fold-change coefficients between a count subset (top30,
+bottom30, or random30) and the full dataset - separately for the single-ligand terms (`ligand1`,
+`ligand2`) and the interaction term (`ligand1:ligand2`).
+
+```{r}
+label_single_coef <- function(df) {
+  df %>%
+    mutate(coef_type = case_when(
+      str_ends(single_ligand, "_round1") ~ "ligand1",
+      str_ends(single_ligand, "_round2") ~ "ligand2",
+      TRUE ~ NA_character_
+    ))
+}
+
+# correlate one coefficient type's lfc between a subset and the full dataset, per combo
+compute_concordance <- function(subset_df, full_df, join_cols, coef_label) {
+  subset_df %>%
+    select(all_of(join_cols), lfc_subset = lfc, padj_subset = adj_pval) %>%
+    inner_join(
+      full_df %>% select(all_of(join_cols), lfc_full = lfc, padj_full = adj_pval),
+      by = join_cols
+    ) %>%
+    drop_na(lfc_subset, lfc_full) %>%
+    # filter for consistent ligands
+    filter(interaction %in% consistent_ligands) %>%
+    group_by(interaction) %>%
+    # filter for significant effects
+    filter((padj_subset < 0.1)|(padj_full < 0.1)) %>%
+    summarise(
+      pearson_corr = cor(lfc_subset, lfc_full, method = "pearson"),
+      n_genes      = n(),
+      .groups      = "drop"
+    ) %>%
+    mutate(coef_type = coef_label)
+}
+
+concordance_for_subset <- function(subset_list, full_singles, full_inter, count_subset) {
+  subset_singles <- label_single_coef(subset_list$singles)
+  full_singles_l <- label_single_coef(full_singles)
+
+  lig1 <- compute_concordance(
+    filter(subset_singles, coef_type == "ligand1"),
+    filter(full_singles_l, coef_type == "ligand1"),
+    join_cols = c("interaction", "name"), coef_label = "single"
+  )
+  lig2 <- compute_concordance(
+    filter(subset_singles, coef_type == "ligand2"),
+    filter(full_singles_l, coef_type == "ligand2"),
+    join_cols = c("interaction", "name"), coef_label = "single"
+  )
+  inter <- compute_concordance(
+    subset_list$inter, full_inter,
+    join_cols = c("interaction", "name"), coef_label = "interaction"
+  )
+
+  bind_rows(lig1, lig2, inter) %>%
+    mutate(count_subset = count_subset)
+}
+
+concordance_all <- bind_rows(
+  concordance_for_subset(top30, full_singles, full_inter, "top30"),
+  concordance_for_subset(bottom30, full_singles, full_inter, "bottom30"),
+  concordance_for_subset(random30, full_singles, full_inter, "random30")
+)
+
+concordance_all
+
+write_csv(concordance_all, file.path(outs_dir, "qc_barcode_counts/correlation_diff_barcode_cutoffs.csv"))
+```
+
+# Plots
+
+```{r, fig.width=10, fig.height=4}
+concordance_all %>%
+  ggplot(aes(x = count_subset, y = pearson_corr, color = count_subset)) +
+  geom_boxplot(position = position_dodge(0.8), width = 0.5) +
+  #geom_point(position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.8), alpha = 0.3, size = 0.8) +
+  ylim(0, 1) +
+  ylab("Pearson r\n(vs. full dataset)") +
+  theme(aspect.ratio = 1) +
+  facet_wrap(~coef_type) +
+  scale_color_brewer(palette = "Dark2") +
+  ggtitle(sprintf(
+    "Reproducible combos only (n=%d)",
+    length(unique(intersect(concordance_all$interaction, consistent_ligands)))
+  ))
+
+ggsave(file.path(outs_dir, "plots/qc_barcode_counts/correlation_diff_barcode_cutoffs.pdf"))
+```
+
+# Test Significance of Difference
+
+Use Tukey HSD test to examine significance of differences in pearson correlation.
+
+```{r}
+concordance_all %>%
+  group_by(coef_type, count_subset) %>%
+  summarise(
+    median_corr = median(pearson_corr, na.rm = TRUE),
+    mean_corr   = mean(pearson_corr, na.rm = TRUE),
+    n_combos    = n(),
+    .groups     = "drop"
+  ) %>%
+  arrange(coef_type, count_subset)
+```
+
+```{r}
+# significance for interactions
+model <- aov(pearson_corr ~ count_subset, data = concordance_all %>% filter(coef_type == "interaction"))
+tukey_results <- TukeyHSD(model)
+print(tukey_results)
+```
+
+```{r}
+# significance for singles
+model <- aov(pearson_corr ~ count_subset, data = concordance_all %>% filter(coef_type == "single"))
+tukey_results <- TukeyHSD(model)
+print(tukey_results)
+```

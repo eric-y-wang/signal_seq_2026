@@ -1,0 +1,187 @@
+---
+title: "SIG14 recombinant protein vs SIG13 comparison"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+---
+
+```{r setup}
+library(tidyverse)
+library(ggplot2)
+library(patchwork)
+library(ggpointdensity)
+library(ggbeeswarm)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Repo-relative paths: inputs are read from imports_stable/, outputs are written to analysis_outs/
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find the repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "02_combinatorial_screen_signalseq_SIG13")
+source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
+dir.create(file.path(outs_dir, "plots/qc"), recursive = TRUE, showWarnings = FALSE)
+theme_set(theme_Publication())
+```
+
+## Goal
+
+Compare recombinant protein interaction effects (SIG14 bulk RNA-seq, DESeq2) to those identified in SIG13
+
+## Import
+
+```{r}
+interScored_SIG13 <- read_csv(file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/interactions_scored_v3_glmGamPoi_0.05filter.csv"))
+interScored_TNF <- read_csv(file.path(imports_dir, "SIG14/analysis_outs/interScored_SIG14_TNF.csv"))
+interScored_CCL <- read_csv(file.path(imports_dir, "SIG14/analysis_outs/interScored_SIG14_CCL.csv"))
+```
+
+## Single Term Comparison
+
+```{r}
+singleTerm_SIG13 <- read_csv(file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/glmGamPoi_single_term/glmGamPoi_singleTerm_lfc_0.05filter.csv"))
+singleTermTNF <- read_csv(file.path(imports_dir, "SIG14/analysis_outs/res_single_tern_SIG14_TNF.csv"))
+singleTermCCL <- read_csv(file.path(imports_dir, "SIG14/analysis_outs/res_single_tern_SIG14_CCL.csv"))
+singleTerm_SIG14 <- bind_rows(singleTermTNF, singleTermCCL) %>%
+  dplyr::rename(condition = treatment,
+                lfc = log2FoldChange,
+                adj_pval = padj) %>%
+  mutate(condition = gsub("IFNg","IFNG",condition),
+         condition = gsub("TGFb","TGFB1",condition))
+```
+```{r}
+single_comb <- singleTerm_SIG13 %>%
+  mutate(condition = gsub("linker","none", condition)) %>%
+  filter(condition %in% singleTerm_SIG14$condition) %>%
+  dplyr::rename(gene = name) %>%
+  # inner join to remove genes that are not detected in either
+  inner_join(singleTerm_SIG14, by = c("gene","condition"), suffix = c("_virus","_recomb")) %>%
+  mutate(across(starts_with("lfc"), ~ tidyr::replace_na(.x, 0))) %>%
+  dplyr::mutate(type = ifelse(grepl("none",condition),"single","combinatorial"))
+```
+
+```{r}
+single_comb %>%
+  filter(adj_pval_virus < 0.01) %>%
+  group_by(condition, type) %>%
+  summarise(pearson_r = cor(lfc_virus, lfc_recomb)) %>%
+  arrange(desc(pearson_r))
+```
+
+
+```{r, fig.height=3}
+single_comb %>%
+  filter(adj_pval_virus < 0.01) %>%
+  group_by(condition, type) %>%
+  summarise(pearson_r = cor(lfc_virus, lfc_recomb)) %>%
+  mutate(type = factor(type, c("single","combinatorial"))) %>%
+  ggplot(aes(x = type, y = pearson_r)) +
+  geom_violin(aes(fill=type)) +
+  geom_beeswarm(fill="white", cex=3, shape=21) +
+  ylim(0,1) +
+  theme(aspect.ratio=1) +
+  scale_fill_manual(values = c("grey","#D95F02FF"))
+
+ggsave(file.path(outs_dir, "plots/qc/SIG13_SIG14_fc_total_lfc_corr_violin.pdf"))
+```
+```{r, fig.height=12, fig.width=17}
+# Filter and prepare data
+plot_data <- single_comb %>%
+  filter(type == "combinatorial") %>%
+  filter(adj_pval_virus < 0.01)
+
+# Generate list of plots
+plot_list <- plot_data %>%
+  group_split(condition) %>%
+  map(~ {
+    r_val <- cor(.x$lfc_virus, .x$lfc_recomb)
+    
+    ggplot(.x, aes(x = lfc_virus, y = lfc_recomb)) +
+      geom_point(alpha=0.5) +
+      geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+      geom_smooth(method = "lm", formula = 'y ~ x', linetype = "dashed", color = "red", se = FALSE) +
+      annotate("text", x = -3, y = 3, label = paste0("r = ", round(r_val, 2))) +
+      xlim(-4, 4) +
+      ylim(-4, 4) +
+      labs(title = unique(.x$condition)) +
+      theme(aspect.ratio = 1)
+  })
+
+# Plot as a grid
+wrap_plots(plot_list, ncol = 5) + 
+  plot_annotation(title = "FC-FC plot SIG13 vs SIG14\nSIG13 padj < 0.01")
+ggsave(file.path(outs_dir, "plots/qc/SIG13_SIG14_fc_total_lfc_corr_plots.pdf"))
+```
+
+## Interaction SIG13 v SIG14 comparison
+
+```{r}
+interScored_TNF <- interScored_TNF  %>%
+  mutate(SIG14_group = "TNF")
+interScored_CCL <- interScored_CCL %>%
+  mutate(SIG14_group = "CCL")
+
+interScored_SIG14 <- bind_rows(interScored_TNF, interScored_CCL)
+
+interScored_SIG14 <- interScored_SIG14 %>%
+  mutate(interaction = gsub("\\.","_", interaction)) %>%
+  mutate(interaction = gsub("IFNg","IFNG",interaction),
+         interaction = gsub("TGFb","TGFB1",interaction),
+         ligand1 = gsub("IFNg","IFNG",ligand1),
+         ligand1 = gsub("TGFb","TGFB1",ligand1))
+```
+
+```{r}
+inter_comb <- interScored_SIG13 %>%
+  filter(interaction %in% interScored_SIG14$interaction) %>%
+  inner_join(interScored_SIG14, by = c("name","interaction"), suffix = c("_virus","_recomb"))
+```
+
+```{r}
+inter_comb %>%
+  filter(SIG14_group == "TNF") %>%
+  filter(adj_pval_interaction_virus  < 0.01) %>%
+  group_by(interaction) %>%
+  summarise(pearson = cor(lfc_interaction_virus, lfc_interaction_recomb))
+```
+
+
+```{r, fig.height=8, fig.width=16}
+# Filter and prepare data
+plot_data <- inter_comb %>%
+  filter(adj_pval_interaction_virus < 0.01)
+
+# Generate list of plots
+plot_list <- plot_data %>%
+  group_split(interaction) %>%
+  map(~ {
+    r_val <- cor(.x$lfc_interaction_virus, .x$lfc_interaction_recomb)
+    
+    ggplot(.x, aes(x = lfc_interaction_virus, y = lfc_interaction_recomb)) +
+      geom_point(alpha = 0.5) +
+      geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+      geom_smooth(method = "lm") +
+      annotate("text", x = -2.5, y = 3, label = paste0("r = ", round(r_val, 2))) +
+      scale_color_brewer(palette = "Dark2") +
+      xlim(-4, 4) +
+      ylim(-4, 4) +
+      labs(title = unique(.x$interaction)) +
+      theme(aspect.ratio = 1)
+  })
+
+# Plot as a grid
+wrap_plots(plot_list, ncol = 7) + 
+  plot_annotation(title = "FC-FC plot SIG13 vs SIG14\nSIG13 padj < 0.01 interaction effects")
+ggsave(file.path(outs_dir, "plots/qc/SIG13_SIG14_fc_interaction_corr_plots.pdf"))
+```

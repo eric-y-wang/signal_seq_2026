@@ -1,0 +1,249 @@
+---
+title: "Ligand Activity Figures: Inflammation Atlas"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE)
+source("viz_helpers.R")
+
+suppressPackageStartupMessages({
+  library(ComplexHeatmap)
+  library(circlize)
+})
+```
+
+# Import
+
+Regression results from `04_regressions_inflammation_atlas.Rmd`, plus the
+disease -> disease-group lookup from the per-sample metadata.
+
+```{r}
+res_disease  <- read_csv(file.path(RES_IN_DIR, "inflammation_atlas_disease.csv"),
+                         show_col_types = FALSE)
+res_level1   <- read_csv(file.path(RES_IN_DIR, "inflammation_atlas_celltype_level1.csv"),
+                         show_col_types = FALSE)
+res_level2   <- read_csv(file.path(RES_IN_DIR, "inflammation_atlas_celltype_level2.csv"),
+                         show_col_types = FALSE)
+
+disease_groups <- read_csv(file.path(SCORE_DIR, "sample_metadata_inflammation_atlas.csv"),
+                           show_col_types = FALSE) %>%
+  distinct(disease, diseaseGroup)
+
+# contrasts are "<disease> - healthy"; the disease alone is the useful label
+strip_ref <- function(res) mutate(res, contrast = str_remove(contrast, " - healthy"))
+res_disease <- strip_ref(res_disease)
+res_level1  <- strip_ref(res_level1)
+res_level2  <- strip_ref(res_level2)
+
+annotations <- load_annotations()
+cat(n_distinct(res_disease$contrast), "diseases,",
+    n_distinct(res_level2$celltype), "fine celltypes\n")
+```
+
+# Model fit
+
+```{r, fig.height=8, fig.width=9}
+(plot_model_fit("inflammation_atlas", "whole sample") +
+  plot_model_fit("inflammation_atlas_celltypeLevel2", "per celltype")) /
+  (plot_alpha_fit("inflammation_atlas", "whole sample") +
+  plot_alpha_fit("inflammation_atlas_celltypeLevel2", "per celltype"))
+```
+
+Per-celltype samples are averaged over fewer cells, so their component scores are
+noisier and the ridge fit is correspondingly weaker -- worth remembering when
+reading the celltype panels below.
+
+# Disease associations
+
+```{r, fig.height=20, fig.width=10}
+plot_volcano(res_disease, facet = "contrast", label = FALSE,
+             title = "Ligand activity vs healthy") /
+  plot_volcano(res_disease, facet = "contrast",
+               title = "Ligand activity vs healthy (labelled)")
+
+save_plot("inflammation_atlas_disease_volcano")
+```
+
+# Cross-disease heatmaps
+
+For a given celltype, every disease's activity estimates side by side. Estimates
+are scaled within disease (so diseases with more patients do not dominate) and
+masked where `padj >= 0.1`. Rows are clustered once across all panels so activities
+stay on the same row in each.
+
+```{r}
+heatmap_across_celltypes <- function(celltypes, vmin = -2.5, vmax = 2.5) {
+  panels <- map(celltypes, function(target) {
+    df <- res_level2 %>%
+      filter(celltype == target) %>%
+      annotate_results(annotations) %>%
+      group_by(contrast) %>%
+      #mutate(estimate_scaled = as.vector(scale(estimate, center = FALSE))) %>%
+      mutate(estimate_scaled = estimate) %>%
+      ungroup()
+
+    to_matrix <- function(value_col, fill) {
+      df %>%
+        select(name, contrast, all_of(value_col)) %>%
+        pivot_wider(names_from = contrast, values_from = all_of(value_col),
+                    values_fill = fill) %>%
+        column_to_rownames("name") %>%
+        as.matrix() %>%
+        replace(!is.finite(.), fill)
+    }
+
+    estimates <- to_matrix("estimate_scaled", 0)
+    padj <- to_matrix("padj", 1)[rownames(estimates), colnames(estimates), drop = FALSE]
+    list(estimates = estimates, padj = padj)
+  })
+  names(panels) <- celltypes
+
+  # one row order for every panel
+  row_dend <- as.dendrogram(hclust(dist(do.call(cbind, map(panels, "estimates"))),
+                                   method = "ward.D2"))
+  groups <- unique(disease_groups$diseaseGroup)
+  group_colors <- setNames(brewer.pal(max(3, length(groups)), "Set1")[seq_along(groups)], groups)
+  color_scale <- colorRamp2(seq(vmin, vmax, length.out = 9), rev(brewer.pal(9, "RdBu")))
+
+  heatmaps <- imap(panels, function(panel, target) {
+    masked <- panel$estimates
+    masked[panel$padj >= SIG_CUTOFF] <- NA
+    last <- target == celltypes[length(celltypes)]
+
+    Heatmap(masked,
+            name = "activity\ndifference",
+            col = color_scale,
+            top_annotation = HeatmapAnnotation(
+              DiseaseGroup = disease_groups$diseaseGroup[match(colnames(masked),
+                                                               disease_groups$disease)],
+              col = list(DiseaseGroup = group_colors),
+              show_legend = target == celltypes[1]),
+            cluster_rows = row_dend,
+            cluster_columns = as.dendrogram(hclust(dist(t(panel$estimates)), method = "ward.D2")),
+            na_col = "grey90", border = TRUE,
+            rect_gp = gpar(col = "white", lwd = 1),
+            column_title = target,
+            show_row_names = last,
+            show_heatmap_legend = last)
+  })
+
+  reduce(heatmaps, `+`)
+}
+```
+
+```{r, fig.height=10, fig.width=8}
+walk(c("T_CD4_Naive", "T_CD4_EM", "T_CD4_EMRA", "T_CD4_eff",
+       "Th0", "Th1", "Th2", "Tregs_activated"),
+     ~ draw(heatmap_across_celltypes(.x)))
+```
+
+```{r, fig.height=10, fig.width=8}
+draw(heatmap_across_celltypes("Th0", vmin = -3, vmax = 3))
+
+pdf(file.path(PLOT_DIR, "inflammation_atlas_cross_Th0.pdf"))
+draw(heatmap_across_celltypes("Th0", vmin = -3, vmax = 3))
+dev.off()
+```
+
+```{r, fig.height=10, fig.width=18}
+TH_CELLTYPES <- c("Th0", "Th1", "Th2", "Tregs_activated")
+draw(heatmap_across_celltypes(TH_CELLTYPES))
+
+pdf(file.path(PLOT_DIR, "inflammation_atlas_cross_celltype.pdf"))
+draw(heatmap_across_celltypes(TH_CELLTYPES))
+dev.off()
+```
+
+# Activity families across celltypes
+
+TNF-family activities in the immune-mediated inflammatory diseases: is the shift
+concentrated in a particular helper subset?
+
+```{r, fig.height=4, fig.width=5}
+AUTOIMMUNE <- c("PS", "PSA", "CD", "UC", "RA")
+
+res_level2 %>%
+  annotate_results(annotations) %>%
+  filter(str_detect(component, "TNF"), contrast %in% AUTOIMMUNE,
+         celltype %in% TH_CELLTYPES, estimate > 0) %>%
+  mutate(significance = ifelse(padj < SIG_CUTOFF, "significant", "ns")) %>%
+  ggplot(aes(x = celltype, y = estimate)) +
+  geom_violin() +
+  geom_jitter(aes(color = significance), size = 1.5, width = 0.1) +
+  scale_color_manual(values = c(ns = "black", significant = "red")) +
+  theme(aspect.ratio = 1) +
+  labs(title = "Increased TNF-family in IMIDs",
+       y = "estimate\n(increased activities only)", x = "")
+
+save_plot("inflammation_atlas_TNF_activity_celltypes")
+```
+
+Interferon and IL27 activities, CD vs UC in Th0:
+
+```{r, fig.height=4, fig.width=5}
+res_level2 %>%
+  annotate_results(annotations) %>%
+  filter(str_detect(component, "IFNG|IL27|IFNA|IFNB1"),
+         celltype == "Th0", contrast %in% c("CD", "UC"), estimate > 0) %>%
+  mutate(significance = ifelse(padj < SIG_CUTOFF, "significant", "ns")) %>%
+  ggplot(aes(x = contrast, y = estimate)) +
+  geom_violin() +
+  geom_jitter(aes(color = significance), size = 1.5, width = 0.1) +
+  scale_color_manual(values = c(ns = "black", significant = "red")) +
+  theme(aspect.ratio = 1) +
+  labs(title = "Increased IFN/IL27 activities in Th0",
+       y = "estimate\n(increased activities only)", x = "")
+
+save_plot("inflammation_atlas_IFN_activity_UC_CD")
+```
+
+# Combination vs single activities
+
+Does a combination activity rise above the single-ligand activities it is built
+from? Estimates are scaled within disease x celltype, as in the heatmaps.
+
+Note on activity names: the final model splits `IFNG`/`IL27` and `IL2`/`IL4`/`IL7`
+into their own single activities (previously `IFNG/IL27_c`, and unsuffixed `IL2`,
+`IL4`, `IL7`), so these panels use `IL4_c` / `IL2_c` where the earlier version used
+`IL4` / `IL2`.
+
+```{r}
+scale_within_group <- function(res) {
+  res %>%
+    annotate_results(annotations) %>%
+    left_join(disease_groups, by = c("contrast" = "disease")) %>%
+    group_by(contrast, celltype) %>%
+    mutate(estimate = as.vector(scale(estimate, center = FALSE))) %>%
+    ungroup()
+}
+
+level2_scaled <- scale_within_group(res_level2)
+level2_imid <- filter(level2_scaled, diseaseGroup == "IMIDs")
+```
+
+```{r, fig.height=9, fig.width=5.5}
+th0_imid <- filter(level2_imid, celltype == "Th0")
+
+plot_contrast_ranges(th0_imid, c("IL27_IL21_c", "IL27_c", "IL21_c")) /
+  plot_contrast_ranges(th0_imid, c("IL4_IL21_c", "IL4_c", "IL21_c")) /
+  plot_contrast_ranges(th0_imid, c("IL6_TNFSF18_c", "IL21_c", "TNFSF18_c"))
+
+save_plot("inflammation_atlas_combination_ranges_autoimmune", width = 5.5, height = 9)
+```
+
+```{r, fig.height=7, fig.width=5.5}
+th0_all <- filter(level2_scaled, celltype == "Th0")
+
+plot_contrast_ranges(th0_all, c("IL27_IL21_c", "IL27_c", "IL21_c"), top_n = 5) /
+  plot_contrast_ranges(th0_all, c("TGFB1_IL4_c", "TGFB1", "IL4_c", "IL2_c"), top_n = 5)
+
+save_plot("inflammation_atlas_combination_ranges_other", width = 5.5, height = 7)
+```
+
+

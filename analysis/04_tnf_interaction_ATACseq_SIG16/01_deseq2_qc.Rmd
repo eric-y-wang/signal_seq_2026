@@ -1,0 +1,239 @@
+---
+title: "SIG16 ATAC: DESeq2 QC (merged replicates, IDR 0.05 peak atlas)"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(DESeq2)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(ggrepel)
+})
+knitr::opts_chunk$set(echo = TRUE)
+
+# Repo-relative paths (inputs: imports_stable/, outputs: analysis_outs/)
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "04_tnf_interaction_ATACseq_SIG16")
+source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
+theme_set(theme_Publication())
+
+set.seed(1)
+options(ggrepel.max.overlaps = Inf)
+
+idr <- 0.05
+job.name <- paste0("idr-", idr, "/")
+
+IN_DIR   <- file.path(imports_dir, "SIG16/analysis_outs/deseq2-merged-reps", job.name)
+OUT_DIR  <- file.path(outs_dir, "deseq2-merged-reps", job.name)
+PLOT_DIR <- file.path(outs_dir, "plots_new", "deseq2-merged-reps", job.name)
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(PLOT_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(outs_dir, "plots"), recursive = TRUE, showWarnings = FALSE)
+```
+
+# Goal
+
+Rebuild the DESeq2 object for the SIG16 bulk ATAC screen (naive CD4 T cells stimulated
+with `ligand1` in {none, IL4, IL6, TGFb} crossed with `ligand2` in {none, TNF}, 3 mice)
+over the IDR 0.05 consensus peak atlas, and reproduce the QC panels from the external
+collaborator's `ATAC-analysis/SIG16_ATAC/1-deseq.R`.
+
+The design is `~ mouse + ligand1 + ligand2 + ligand1:ligand2`, so the model carries a
+per-mouse blocking term, the two single-ligand main effects, and the interaction term
+that the downstream synergy/antagonism calls are built on.
+
+# Import
+
+`counts_mat.rds` is the `Rsubread::featureCounts` output over the peak atlas; `annotation.tsv`
+is the ChIPseeker annotation of the same atlas (peak -> nearest gene / distance to TSS).
+
+```{r}
+counts_mat <- readRDS(file.path(IN_DIR, "counts_mat.rds"))
+count.matrix <- counts_mat$counts
+
+annot <- read.csv(file.path(imports_dir, "SIG16/analysis_outs/chipseeker", job.name,
+                            "all.peakatlas/annotation.tsv"), sep = "\t")
+
+# Condition / ligand colors come from the RColorBrewer "Paired" palette: each ligand1
+# gets one light/dark pair, light = ligand2 none, dark = ligand2 TNF. Written back to
+# `plots/palette.rds`, which is what 02_/03_/04_ read.
+paired <- brewer.pal(12, "Paired")
+names(paired) <- c("lt.blue", "blue", "lt.green", "green", "lt.red", "red",
+                   "lt.orange", "orange", "lt.purple", "purple", "lt.brown", "brown")
+
+pal <- list(
+  condition = c(
+    none_none = unname(paired["lt.purple"]),
+    none_TNF  = unname(paired["purple"]),
+    IL4_none  = unname(paired["lt.blue"]),
+    IL4_TNF   = unname(paired["blue"]),
+    IL6_none  = unname(paired["lt.green"]),
+    IL6_TNF   = unname(paired["green"]),
+    TGFb_none = unname(paired["lt.red"]),
+    TGFb_TNF  = unname(paired["red"])
+  ),
+  ligand1 = c(
+    none = unname(paired["purple"]),
+    IL4  = unname(paired["blue"]),
+    IL6  = unname(paired["green"]),
+    TGFb = unname(paired["red"])
+  ),
+  ligand2 = c(
+    none = unname(paired["lt.orange"]),
+    TNF  = unname(paired["orange"])
+  ),
+  rep = c(`1` = unname(paired["blue"]),
+          `2` = unname(paired["green"]),
+          `3` = unname(paired["red"]))
+)
+saveRDS(pal, file.path(outs_dir, "plots/palette.rds"))
+
+dim(count.matrix)
+colSums(count.matrix)
+```
+
+# Sample metadata
+
+Sample names encode `{ligand1}_{ligand2}_{rep}`; replicate index is also the mouse of origin.
+
+```{r}
+condition <- factor(str_split_i(colnames(count.matrix), "_[1-3]", i = 1),
+                    levels = c("none_none", "none_TNF", "IL4_none", "IL4_TNF",
+                               "IL6_none", "IL6_TNF", "TGFb_none", "TGFb_TNF"))
+ligand1 <- factor(str_split_i(colnames(count.matrix), "_", i = 1),
+                  levels = c("none", "IL4", "IL6", "TGFb"))
+ligand2 <- factor(str_split_i(colnames(count.matrix), "_", i = 2),
+                  levels = c("none", "TNF"))
+rep   <- factor(str_split_i(colnames(count.matrix), "_", i = 3))
+mouse <- factor(rep(c(1, 2, 3), 8), levels = c(1, 2, 3))
+
+metadata <- data.frame(condition = condition, ligand1 = ligand1, ligand2 = ligand2,
+                       rep = rep, mouse = mouse)
+rownames(metadata) <- colnames(count.matrix)
+metadata
+```
+
+# FRiP
+
+Fraction of reads in peaks, taken from the `featureCounts` assignment summary.
+
+```{r, fig.width=8, fig.height=6}
+FRiP_scores_atlas <- apply(counts_mat$stat[, !colnames(counts_mat$stat) %in% c("Status")],
+                           2, function(sample) sample[1] / sum(sample))
+FRiP_scores_atlas.df <- data.frame(sample = colnames(count.matrix),
+                                   FRiP = FRiP_scores_atlas,
+                                   condition = condition)
+
+frip.p <- ggplot(FRiP_scores_atlas.df) +
+  geom_bar(aes(x = sample, y = FRiP, fill = condition), stat = "identity") +
+  scale_fill_manual(values = pal$condition) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+frip.p
+ggsave(file.path(outs_dir, "plots_new", paste0("bar-FRiP-idr-", idr, ".pdf")),
+       frip.p, width = 8, height = 6)
+```
+
+# Fit DESeq2
+
+Set `refit <- TRUE` to re-run `DESeq()` (a few minutes over ~63k peaks); otherwise the
+stored fit is loaded.
+
+```{r}
+refit <- FALSE
+
+if (refit) {
+  dds <- DESeqDataSetFromMatrix(count.matrix, colData = metadata,
+                                design = ~ mouse + ligand1 + ligand2 + ligand1:ligand2)
+  dds <- DESeq(dds)
+
+  saveRDS(dds, file.path(OUT_DIR, "deseq2_dataset.rds"))
+  saveRDS(metadata, file.path(OUT_DIR, "metadata.rds"))
+  write.csv(metadata, file.path(OUT_DIR, "metadata.csv"), quote = FALSE)
+
+  # VST matrix with the ChIPseeker annotation columns (distance to TSS / nearest gene)
+  # pasted on, keyed by peak ID. Row order and rownames follow the DESeq2 object.
+  normalized_counts <- vst(dds, blind = FALSE) %>%
+    assay() %>%
+    as.data.frame() %>%
+    rownames_to_column("peak") %>%
+    left_join(annot %>% dplyr::select(peak = name, distanceToTSS, geneSymbol),
+              by = "peak") %>%
+    column_to_rownames("peak")
+  saveRDS(normalized_counts, file.path(OUT_DIR, "normalized_counts.rds"))
+} else {
+  # stable copy of the stored fit
+  dds <- readRDS(file.path(IN_DIR, "deseq2_dataset.rds"))
+  metadata <- readRDS(file.path(IN_DIR, "metadata.rds"))
+  normalized_counts <- readRDS(file.path(IN_DIR, "normalized_counts.rds"))
+}
+
+resultsNames(dds)
+```
+
+Peaks that are zero in every sample (should be none, the atlas is built from called peaks):
+
+```{r}
+sum(rowSums(normalized_counts[, rownames(metadata)] == 0) == nrow(metadata))
+```
+
+# Dispersion
+
+```{r, fig.width=6, fig.height=6}
+plotDispEsts(dds)
+
+pdf(file.path(PLOT_DIR, "dispersion.pdf"))
+plotDispEsts(dds)
+invisible(dev.off())
+```
+
+# PCA
+
+VST on the top 20% most variable peaks, `blind = FALSE` so the design is respected.
+
+```{r, fig.width=4, fig.height=4}
+vsd <- vst(dds, blind = FALSE)
+vsd.mat <- assay(vsd)
+
+pcaData <- plotPCA(vsd, intgroup = "condition", returnData = TRUE,
+                   ntop = round(0.2 * nrow(vsd)))
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+pcaData$sample <- pcaData$name
+
+pca.p <- ggplot(pcaData, aes(PC1, PC2, color = condition, label = sample)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = pal$condition) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  theme(aspect.ratio = 1)
+pca.p
+ggsave(file.path(PLOT_DIR, "pca-name.pdf"), pca.p)
+```
+
+# Sample-sample correlation
+
+```{r, fig.width=12, fig.height=12}
+vsd.cor <- cor(vsd.mat)
+heat.colors <- colorRampPalette(brewer.pal(6, "YlOrRd"))(100)
+
+cor.p <- pheatmap::pheatmap(vsd.cor,
+                            annotation = metadata[, c("ligand1", "ligand2", "mouse")],
+                            color = heat.colors,
+                            cluster_cols = TRUE, cluster_rows = TRUE,
+                            border_color = "white")
+save_pheatmap_pdf(cor.p, file.path(PLOT_DIR, "heatmap-sample_correlation.pdf"),
+                  width = 14, height = 14)
+```

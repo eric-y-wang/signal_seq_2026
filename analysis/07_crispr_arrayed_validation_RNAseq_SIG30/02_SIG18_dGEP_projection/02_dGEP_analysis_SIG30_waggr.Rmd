@@ -1,0 +1,369 @@
+---
+title: "SIG30 dGEP Analysis: waggr"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+---
+
+# Goal
+
+Test effects of **SIG30** CRISPR knockouts on dGEPs (sparse-PCA components
+derived from the sibling project **SIG18**). Each SIG30 sample gets
+one score per SIG18 program, computed by decoupler's `waggr` in
+`01_dGEP_scoring_SIG30.ipynb`.
+
+A linear model is used to associate perturbations with dGEP changes. Scores are
+z-scaled per program before fitting, matching how SIG18 fits its own programs
+(`analysis/05_in_vitro_differentiation_RNAseq_SIG18/02_spca/03_spca_annotation.Rmd`), so estimates from the two
+experiments are on the same scale: SDs of that program's score.
+
+# Import
+
+```{r setup}
+library(tidyverse)
+library(patchwork)
+library(broom)
+library(emmeans)
+library(ggrepel)
+library(RColorBrewer)
+library(pheatmap)
+library(gridExtra)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# Repo-relative paths: inputs from imports_stable/, outputs to analysis_outs/<module>/
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "07_crispr_arrayed_validation_RNAseq_SIG30")
+source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
+theme_set(theme_Publication())
+
+# ---- config ----
+score_method <- "waggr"
+sig_alpha    <- 0.1   # used for "significant" labels and counts
+in_dir       <- file.path(imports_dir, "SIG30/analysis_outs/inference_SIG18")  # waggr scores from 01_dGEP_scoring_SIG30
+out_dir      <- file.path(outs_dir, "inference_SIG18")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# SIG18 sPCA/dGEP outputs this analysis reads (from analysis/05_in_vitro_differentiation_RNAseq_SIG18)
+sig18_dir             <- file.path(imports_dir, "SIG18")
+sig18_lm_scored_clean <- file.path(sig18_dir, "analysis_outs/spca/lm_scored_zscore_degs_alpha10.0_sPCA_clean.csv")
+sig18_lm_fit_path     <- file.path(sig18_dir, "analysis_outs/spca/lm_fit_zscore_degs_alpha10.0_sPCA.csv")
+```
+
+
+```{r helpers}
+# Pick the top `n` programs that respond to ONE ligand only: the `p_col`/`est_col`
+# main effect clears the thresholds while the other ligand's main effect
+# (`other_p_col`/`other_est_col`) does not. Synergistic programs are excluded so
+# the three classes below stay mutually exclusive.
+ligand_only_components <- function(df, p_col, est_col, other_p_col, other_est_col,
+                                   p_threshold = 0.1, est_threshold = 0.5, n = 5) {
+  df %>%
+    filter(!grepl("synergy positive", interaction_class)) %>%
+    filter(.data[[p_col]] < p_threshold & .data[[est_col]] > est_threshold) %>%
+    filter(!(.data[[other_p_col]] < p_threshold & .data[[other_est_col]] > 0)) %>%
+    slice_min(.data[[p_col]], n = n) %>%
+    pull(component)
+}
+
+# Long -> wide: one row per program, one column per level of `col`, filled with
+# `value`. Rows/columns are returned in `row_order`/`col_order`.
+as_program_matrix <- function(df, col, value, row_order, col_order = NULL) {
+  mat <- df %>%
+    filter(program %in% row_order) %>%
+    dplyr::select(program, all_of(c(col, value))) %>%
+    pivot_wider(names_from = all_of(col), values_from = all_of(value)) %>%
+    column_to_rownames("program") %>%
+    as.matrix()
+  if (is.null(col_order)) col_order <- colnames(mat)
+  mat[row_order, col_order, drop = FALSE]
+}
+
+# Adjusted p-values -> significance stars, on the conventional 0.05/0.01/0.001
+# ladder (note: deliberately NOT `sig_alpha`, which is the looser 0.1 cutoff used
+# for labelling programs elsewhere in this notebook).
+# Same convention as analysis/03_program_crossreg/Th_receptor_crossregulation.Rmd.
+stars_from_padj <- function(p) {
+  stars_vec <- case_when(
+    is.na(as.vector(p))  ~ "",
+    as.vector(p) < 0.001 ~ "***",
+    as.vector(p) < 0.01  ~ "**",
+    as.vector(p) < 0.05  ~ "*",
+    TRUE                 ~ ""
+  )
+  matrix(stars_vec, nrow = nrow(p), ncol = ncol(p), dimnames = dimnames(p))
+}
+```
+
+# Import scores
+
+Score columns arrive named `SIG18_waggr_comp_<n>`; they are renamed to the bare
+program id (`comp_<n>`) on import so that SIG30 scores and SIG18's annotation
+tables key on the same identifier for the rest of the notebook.
+
+Each program's scores are then z-scaled across the 30 SIG30 samples. SIG18 does
+the same to its own scores before fitting, so this puts the estimates of both
+models in the same units (SDs of that program's score within its experiment)
+and makes the two heatmap panels below directly comparable.
+
+```{r}
+scores <- read_csv(file.path(in_dir, "waggr_scored_obs_SIG30.csv")) %>%
+  rename_with(\(x) str_extract(x, "comp_[0-9]+"), starts_with("SIG18_")) %>%
+  mutate(
+    target    = relevel(factor(target), ref = "control"),
+    replicate = factor(replicate)
+  )
+
+programs <- grep("^comp_[0-9]+$", colnames(scores), value = TRUE)
+
+scores <- scores %>%
+  mutate(across(all_of(programs), \(x) as.numeric(scale(x))))
+
+cat(score_method, ":", length(programs), "SIG18 program scores on", nrow(scores), "samples\n")
+```
+
+# Target associations
+
+For each program, `score ~ target + replicate` on the z-scaled score, then
+estimated-marginal-means contrasts of each CRISPR-KO target vs. `control`. The
+resulting `estimate` is the KO's effect on that program in SD units, and is what
+the heatmap below plots.
+
+Contrasts are extracted **unadjusted** (`adjust = "none"`), and a single
+Benjamini-Hochberg correction is then applied **globally**, across all
+program x target tests at once. `p_adj` is the only p-value used below.
+
+```{r}
+target_assoc <- map_dfr(programs, function(program) {
+  fit <- lm(as.formula(paste0("`", program, "` ~ target + replicate")), data = scores)
+  emm <- emmeans(fit, ~ target)
+  contrast(emm, "trt.vs.ctrl", ref = "control", adjust = "none") %>%
+    broom::tidy() %>%
+    mutate(program = program)
+}) %>%
+  mutate(
+    p_adj  = p.adjust(p.value, method = "BH"),
+    target = str_trim(str_remove(contrast, "-\\s*control$"))
+  )
+
+write_csv(target_assoc, file.path(out_dir, paste0("scoreAssoc_", score_method, "_SIG30.csv")))
+target_assoc %>% arrange(p_adj) %>% head(10)
+```
+
+## Number of significant programs per target
+
+```{r}
+target_assoc %>%
+  group_by(contrast) %>%
+  summarise(n_sig = sum(p_adj < sig_alpha), .groups = "drop") %>%
+  ggplot(aes(x = reorder(contrast, n_sig), y = n_sig)) +
+  geom_col() +
+  coord_flip() +
+  labs(x = "target (vs control)", y = paste0("n significant programs (padj < ", sig_alpha, ")")) +
+  theme(aspect.ratio=1)
+```
+
+# Effect-size heatmap: TGFb/TNF class programs
+
+Two panels, sharing rows and color scale. Both show **linear-model estimates**
+on z-scaled scores, so the numbers are in comparable SD units:
+
+- **left** — SIG30 KO effect: the emmeans `target` vs. `control` contrast from
+  the section above, starred by its globally BH-adjusted p-value.
+- **right** — the same programs in the original SIG18 ligand experiment, from
+  SIG18's `ligand1 * ligand2` model: the `TGFb` and `TNF` main effects, and
+  their combined effect (`TGFb` + `TNF` + interaction, SIG18's
+  `estimate_total_interaction_model`). Left unstarred because no single
+  coefficient tests that summed combined effect.
+
+Note the two experiments push in opposite directions — SIG18 *adds* ligand while
+SIG30 *removes* a receptor — so for a ligand-driven program the two panels are
+expected to disagree in sign.
+
+## Selecting programs
+
+Rows are limited to the TGFb/TNF-relevant programs, split into three classes
+using SIG18's own two-ligand model: the 5 most significant **positively
+synergistic** programs, the 5 most **TGFb-specific**, and the 5 most
+**TNF-specific**.
+
+```{r}
+# SIG18 tested several ligand1 arms (iTreg/TGFb/Th1/Th17/Th2) against ligand2 TNF;
+# keep only the TGFb x TNF arm, where ligand1 == TGFb and ligand2 == TNF.
+sig18_lm_scored <- read_csv(sig18_lm_scored_clean) %>%
+  filter(interaction == "TGFb_TNF")
+
+comp_class <- bind_rows(
+  tibble(class     = "synergy positive",
+         component = sig18_lm_scored %>%
+           filter(interaction_class == "synergy positive") %>%
+           slice_min(p_adj_interaction, n = 5) %>%
+           pull(component)),
+  tibble(class     = "tgfb",
+         component = ligand_only_components(sig18_lm_scored, "p_adj_ligand1", "estimate_ligand1",
+                                            "p_adj_ligand2", "estimate_ligand2")),
+  tibble(class     = "tnf",
+         component = ligand_only_components(sig18_lm_scored, "p_adj_ligand2", "estimate_ligand2",
+                                            "p_adj_ligand1", "estimate_ligand1"))
+) %>%
+  distinct(component, .keep_all = TRUE) %>%
+  arrange(class, component)
+
+comp_class
+```
+
+## Building the matrices
+
+```{r}
+# row annotation + row order, shared by both panels
+ann_row  <- comp_class %>% column_to_rownames("component")
+row_order <- rownames(ann_row)
+gaps_row <- head(cumsum(table(ann_row$class)), -1)
+class_colors <- setNames(
+  brewer.pal(max(3, n_distinct(ann_row$class)), "Set2")[seq_len(n_distinct(ann_row$class))],
+  sort(unique(ann_row$class))
+)
+
+# column order for each panel (KO targets grouped by pathway; ligand arms)
+SIG30_order <- c("Stat5b", "Stat5a", "Il2ra", "Gata3", "Tgfbr2", "Ptpn1", "Nr4a3", "Tnfrsf1b", "Tnfrsf1a")
+SIG18_order <- c("TNF", "TGFb", "TGFb+TNF")
+
+# SIG30 KO: emmeans estimate of target vs control, and its matching p-value
+mat_sgrna   <- as_program_matrix(target_assoc, "target", "estimate", row_order, SIG30_order)
+stars_sgrna <- as_program_matrix(target_assoc, "target", "p_adj", row_order, SIG30_order) %>%
+  stars_from_padj()
+
+# SIG18 ligands: main effects of each ligand, plus their combined effect
+# (estimate_ligand1 + estimate_ligand2 + estimate_interaction, precomputed by SIG18)
+mat_sig18 <- sig18_lm_scored %>%
+  dplyr::select(program = component,
+                TNF        = estimate_ligand2,
+                TGFb       = estimate_ligand1,
+                `TGFb+TNF` = estimate_total_interaction_model) %>%
+  pivot_longer(-program, names_to = "condition", values_to = "estimate") %>%
+  as_program_matrix("condition", "estimate", row_order, SIG18_order)
+```
+
+## Drawing
+
+```{r, fig.height=4, fig.width=8}
+hm_colors <- colorRampPalette(rev(brewer.pal(11, "RdBu")))(100)
+
+# `mat`/`stars` already carry the intended row and column order (see above), so
+# no reordering happens here. `stars = NULL` draws the panel without annotations.
+plot_class_heatmap <- function(mat, title, stars = NULL) {
+  hm_breaks <- seq(-max(abs(min(mat)),max(mat)), max(abs(min(mat)),max(mat)), length.out = 101)
+  pheatmap(mat,
+           color = hm_colors, breaks = hm_breaks,
+           annotation_row = ann_row,
+           annotation_colors = list(class = class_colors),
+           cluster_rows = FALSE, cluster_cols = FALSE,
+           gaps_row = gaps_row,
+           main = title,
+           display_numbers = if (is.null(stars)) FALSE else stars,
+           fontsize_number = 10, number_color = "black",
+           fontsize_row = 8, fontsize_col = 8, silent = TRUE,
+           angle_col = 90)
+}
+
+combined_hm <- arrangeGrob(
+  plot_class_heatmap(mat_sgrna, "SIG30 sgRNA KO\nlm estimate vs control", stars_sgrna)$gtable,
+  plot_class_heatmap(mat_sig18, "SIG18 ligand treatment\nlm estimate vs Th0")$gtable,
+  ncol = 2, widths = c(1.4, 1)
+)
+
+grid.newpage()
+grid.draw(combined_hm)
+```
+
+```{r}
+pdf(file.path(out_dir, paste0("scoreHeatmap_classEstimate_SIG18vsSIG30_", score_method, ".pdf")),
+    width = 8, height = 4)
+grid.draw(combined_hm)
+dev.off()
+```
+
+The SIG30 panel on its own, transposed to targets x programs for a wide figure.
+The program class annotation and its gaps move from rows to columns with the
+transpose, so `ann_row`/`gaps_row` are passed as `annotation_col`/`gaps_col`.
+
+```{r, fig.height=2.5, fig.width=6}
+hm_breaks <- seq(-max(abs(min(mat_sgrna)),max(mat_sgrna)),
+                 max(abs(min(mat_sgrna)),max(mat_sgrna)), length.out = 101)
+hm <- pheatmap(
+  t(mat_sgrna),
+  color = hm_colors,
+  breaks = hm_breaks,
+  annotation_col = ann_row,
+  annotation_colors = list(class = class_colors),
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  gaps_col = gaps_row,
+  display_numbers = t(stars_sgrna),
+  fontsize_number = 10,
+  number_color = "black",
+  fontsize_row = 8,
+  fontsize_col = 8,
+  angle_col = 90
+)
+save_pheatmap_pdf(hm, file.path(out_dir, "scoreHeatmap_classEstimate_SIG30_waggr.pdf"), width = 6, height = 2.5)
+```
+
+
+
+# Volcano plots (target effect per program)
+
+One panel per KO target: the program's score effect vs. `control` against its
+significance, with programs at padj < `r sig_alpha` labelled.
+
+Each point is additionally annotated with how that program behaved in SIG18:
+fill = the estimate of a chosen SIG18 model term, size = that term's
+`-log10(padj)`, both from `lm_fit_zscore_degs_alpha10.0_sPCA.csv`. Three
+overlays are drawn — the TGFb x TNF interaction, and each ligand's main effect.
+
+```{r}
+sig18_lm_fit <- read_csv(sig18_lm_fit_path)
+
+volcano_interaction <- function(overlay_term) {
+  overlay <- sig18_lm_fit %>%
+    filter(term == overlay_term) %>%
+    dplyr::select(program = component, estimate_overlay = estimate, p_adj_overlay = p_adj)
+
+  target_assoc %>%
+    left_join(overlay, by = "program") %>%
+    ggplot(aes(x = estimate, y = -log10(p_adj))) +
+    geom_hline(yintercept = -log10(sig_alpha), lty = 2, color = "grey60") +
+    geom_vline(xintercept = 0, lty = 2, color = "grey60") +
+    geom_point(aes(fill = estimate_overlay, size = -log10(p_adj_overlay)), shape = 21) +
+    geom_text_repel(aes(label = ifelse(p_adj < sig_alpha, program, "")),
+                    size = 2, max.overlaps = 15) +
+    scale_fill_distiller(palette = "RdBu") +
+    facet_wrap(~ contrast) +
+    theme(aspect.ratio = 1) +
+    labs(title = paste0("SIG18 programs — SIG30 (", score_method, ")"),
+         x = "score effect vs control (SD)",
+         fill = paste0("estimate\n", overlay_term),
+         size = paste0("pscore\n", overlay_term))
+}
+```
+
+```{r, fig.width=14, fig.height=12}
+overlays <- c("ligand1TGFb:ligand2TNF", "ligand1TGFb", "ligand2TNF")
+
+walk(overlays, \(ov) {
+  p <- volcano_interaction(ov)
+  print(p)
+  ggsave(file.path(out_dir, paste0("scoreVolcano_SIG18_", gsub("[^A-Za-z0-9]+", "_", ov),
+                                   "_", score_method, "_SIG30.pdf")),
+         p, width = 14, height = 12)
+})
+```

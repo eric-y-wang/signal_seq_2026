@@ -1,0 +1,172 @@
+---
+title: "Combinatorial Reinforcement Representative Visualization"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup}
+library(tidyverse)
+library(patchwork)
+library(ggrepel)
+knitr::opts_chunk$set(echo = TRUE)
+# Repo-relative paths: inputs from imports_stable/, outputs to analysis_outs/
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "02_combinatorial_screen_signalseq_SIG13")
+dir.create(file.path(outs_dir, "signal_reinforcement_lfc_mean/figures"), showWarnings = FALSE, recursive = TRUE)
+source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
+theme_set(theme_Publication())
+```
+
+# Import
+
+```{r}
+deg_condition <- read_csv(file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/glmGamPoi_single_term/glmGamPoi_singleTerm_lfc_0.05filter.csv"))
+res <- read_csv(file.path(imports_dir, "SIG13/analysis_outs/signal_reinforcement_lfc_mean/results_combined_0.1filter.csv"))
+```
+
+# IL6/21 + CCL19/21A
+
+These combinations are interesting because IL6 and IL21 both signal predominatly through STAT3. However, IL21 has strong synergistic effects in combination with CCR7 ligands (CCL19/21A) while IL6 has weak synergistic effects. Here, we examine whether signal reinforcement is differentially present between the two types of combinations.
+
+```{r}
+condition_sub <- c("IL21_linker","IL6_linker","linker_CCL19","linker_CCL21A")
+receptors <- c("Il21r","Il6ra","Ccr7")
+
+deg_sub <- deg_condition %>%
+  filter(condition %in% condition_sub) %>%
+  filter(name %in% receptors) %>%
+  mutate(condition = gsub("_linker|linker_","",condition))
+
+res_sub <- res %>%
+  filter(interaction %in% c("IL21_CCL19","IL21_CCL21A","IL6_CCL19","IL6_CCL21A"))
+```
+
+```{r}
+sig_stars <- function(p) {
+  case_when(
+    p < 0.0001 ~ "****",
+    p < 0.001 ~ "***",
+    p < 0.01  ~ "**",
+    p < 0.05  ~ "*",
+    TRUE      ~ ""
+  )
+}
+
+p1 <- deg_sub %>%
+  filter(name == "Ccr7") %>%
+  filter(condition %in% c("IL21","IL6")) %>%
+  mutate(stars = sig_stars(adj_pval)) %>%
+  ggplot(aes(x = condition, y = name)) +
+  geom_point(aes(fill = lfc, size = -log10(adj_pval)), shape = 21) +
+  geom_text(aes(label = stars), nudge_y = 0.2, size = 4, vjust = 0) +
+  scale_fill_distiller(palette = "RdBu", limits = c(-0.45, 0.45)) +
+  scale_size_continuous(limits = c(0, 16)) +
+  coord_equal() +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+
+p2 <- deg_sub %>%
+  filter(name %in% c("Il21r","Il6ra")) %>%
+  filter(condition %in% c("CCL19","CCL21A")) %>%
+  mutate(stars = sig_stars(adj_pval)) %>%
+  ggplot(aes(x = condition, y = name)) +
+  geom_point(aes(fill = lfc, size = -log10(adj_pval)), shape = 21) +
+  geom_text(aes(label = stars), nudge_y = 0.2, size = 4, vjust = 0) +
+  scale_fill_distiller(palette = "RdBu", limits = c(-0.45, 0.45)) +
+  scale_size_continuous(limits = c(0, 16)) +
+  coord_equal() +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+
+p1 + p2 + plot_layout(ncol = 1, guides = "collect") + plot_annotation("IL6/21 + CCL19/21A receptor cross-regulation")
+ggsave(file.path(outs_dir, "signal_reinforcement_lfc_mean/figures/IL21_CCL_receptor_dotplot.pdf"))
+```
+
+```{r, fig.height=3, fig.width=12}
+p1 <- res_sub %>%
+  ggplot(aes(x = lfc_mean_sum, y = n_synergy_positive)) +
+  geom_point(aes(color = interaction)) +
+  scale_color_brewer(palette = "Paired") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  theme(aspect.ratio = 1)
+
+p2 <- res_sub %>%
+  ggplot(aes(x = lfc_mean_sum, y = n_synergy_negative)) +
+  geom_point(aes(color = interaction)) +
+  scale_color_brewer(palette = "Paired") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  theme(aspect.ratio = 1)
+
+p3 <- res_sub %>%
+  ggplot(aes(x = lfc_mean_sum, y = n_synergy_total)) +
+  geom_point(aes(color = interaction)) +
+  scale_color_brewer(palette = "Paired") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  theme(aspect.ratio = 1)
+
+p4 <- res_sub %>%
+  ggplot(aes(x = lfc_mean_sum, y = n_buffering)) +
+  geom_point(aes(color = interaction)) +
+  scale_color_brewer(palette = "Paired") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  theme(aspect.ratio = 1)
+
+p1+p2+p3+p4+plot_layout(ncol=4, guides = "collect")
+
+ggsave(file.path(outs_dir, "signal_reinforcement_lfc_mean/figures/IL21_CCL_receptor_scatter.pdf"))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

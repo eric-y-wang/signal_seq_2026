@@ -1,0 +1,193 @@
+---
+title: "Ligand Activity Figures: AMP 2023 (rheumatoid arthritis)"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE)
+source("viz_helpers.R")
+```
+
+# Import
+
+Regression results from `05_regressions_amp_2023.Rmd`.
+
+```{r}
+res_disease <- read_csv(file.path(RES_IN_DIR, "amp_2023_disease_binary.csv"),
+                        show_col_types = FALSE)
+res_disease_celltype <- read_csv(file.path(RES_IN_DIR, "amp_2023_disease_celltype.csv"),
+                                 show_col_types = FALSE)
+res_celltype <- read_csv(file.path(RES_IN_DIR, "amp_2023_celltype.csv"),
+                         show_col_types = FALSE)
+
+# CTAP contrasts come back as "(E + F + M) - control"; compact to "EFM"
+compact_ctap <- function(res) {
+  mutate(res, contrast = str_remove_all(contrast, " - control|\\(|\\)| \\+ "))
+}
+res_ctap <- read_csv(file.path(RES_IN_DIR, "amp_2023_ctap_control_ref.csv"),
+                     show_col_types = FALSE) %>% compact_ctap()
+res_ctap_celltype <- read_csv(file.path(RES_IN_DIR, "amp_2023_ctap_celltype_control_ref.csv"),
+                              show_col_types = FALSE) %>% compact_ctap()
+
+TPH_CELLTYPES <- c("T-3: CD4+ IFNG- Tph/Tfh", "T-7: CD4+ IFNG+ Tph/Tfh")
+NAIVE_CELLTYPE <- "T-4: CD4+ naive"
+TREG_CELLTYPES <- c("T-9: CD4+ CD25-low Treg", "T-8: CD4+ CD25-high Treg")
+```
+
+# Model fit
+
+```{r, fig.height=9, fig.width=9}
+(plot_model_fit("amp_2023", "whole biopsy") + plot_model_fit("amp_2023_celltype", "per celltype")) /
+  (plot_alpha_fit("amp_2023", "whole biopsy") + plot_alpha_fit("amp_2023_celltype", "per celltype"))
+```
+
+# Disease associations
+
+```{r, fig.height=6, fig.width=9}
+plot_volcano(res_disease, label = FALSE, ymax = 3, title = "RA vs osteoarthritis") +
+  plot_volcano(res_disease, ymax = 3, title = "RA vs osteoarthritis (labelled)")
+
+save_plot("amp_disease_volcano", width = 8, height = 4)
+```
+
+## By celltype
+
+```{r, fig.height=4, fig.width=5}
+plot_significance_grid(res_disease_celltype,
+                       title = "Activities differing\nRA vs control")
+save_plot("amp_disease_celltype_significance_grid")
+```
+
+```{r, fig.height=8, fig.width=12}
+res_disease_celltype %>%
+  filter(celltype %in% c(TPH_CELLTYPES, NAIVE_CELLTYPE, TREG_CELLTYPES)) %>%
+  plot_volcano(facet = "celltype", title = "RA vs control, by celltype")
+
+save_plot("amp_disease_celltype_volcano")
+```
+
+The Tph/Tfh subsets split by IFNG expression, so comparing their estimates directly
+asks whether a given activity is specific to the IFNG+ compartment.
+
+```{r}
+# T-3 (IFNG-) vs T-7 (IFNG+) estimates for one contrast
+plot_tph_comparison <- function(res, contrast_filter = NULL, title = NULL) {
+  df <- res %>% filter(celltype %in% TPH_CELLTYPES)
+  if (!is.null(contrast_filter)) df <- filter(df, contrast == contrast_filter)
+
+  df %>%
+    annotate_results() %>%
+    mutate(celltype = str_remove(celltype, ":.*")) %>%
+    pivot_wider(id_cols = c(component, name), names_from = celltype,
+                values_from = c(estimate, padj)) %>%
+    mutate(significance = case_when(
+      `padj_T-3` < SIG_CUTOFF & `padj_T-7` < SIG_CUTOFF ~ "Both",
+      `padj_T-3` < SIG_CUTOFF ~ "T-3 (IFNG-)",
+      `padj_T-7` < SIG_CUTOFF ~ "T-7 (IFNG+)",
+      TRUE ~ "NS")) %>%
+    filter(significance != "NS") %>%
+    ggplot(aes(x = `estimate_T-3`, y = `estimate_T-7`)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey") +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey") +
+    geom_point(aes(color = significance)) +
+    geom_text_repel(aes(label = name), size = 2, max.overlaps = 20) +
+    scale_color_brewer(palette = "Dark2") +
+    theme(aspect.ratio = 1) +
+    labs(title = title, x = "estimate, IFNG- Tph/Tfh", y = "estimate, IFNG+ Tph/Tfh")
+}
+```
+
+```{r, fig.height=5, fig.width=6}
+plot_tph_comparison(res_disease_celltype, title = "RA vs control in Tph/Tfh subsets")
+save_plot("amp_tph_disease_scatter", width = 6, height = 5)
+```
+
+```{r, fig.height=5, fig.width=8}
+# `IL27_TNF_c` is this model's name for the old `IL27_TNFSF18_c` consensus, and
+# `IL4_c` for the old single `IL4`
+plot_activity_ranges(
+  res_disease_celltype %>%
+    filter(celltype %in% c(TPH_CELLTYPES, NAIVE_CELLTYPE)),
+  activities = with_component_singles(c("IL27_TNF_c", "TGFB1_TNFSF18_c", "IL4_TNFSF18_c")),
+  group = "celltype",
+  title = "RA vs control: combinations and their single ligands"
+)
+
+save_plot("amp_tph_comparison")
+```
+
+# CTAP associations
+
+Each cell-type-abundance phenotype against the osteoarthritis controls: do
+different synovial neighbourhoods impose different combinatorial signals?
+
+```{r, fig.height=4.5, fig.width=6}
+ctap_top <- top_activities(res_ctap, n = 10, combinatorial_only = TRUE)
+
+plot_activity_tiles(res_ctap, ctap_top, order_by_estimate = FALSE,
+                    title = "Top 10 combinatorial activities by CTAP")
+save_plot("amp_ctap_tiles")
+```
+
+```{r, fig.height=5, fig.width=7}
+plot_significance_grid(res_ctap_celltype, split_direction = TRUE,
+                       title = "Activities differing from control, by CTAP")
+save_plot("amp_ctap_celltype_significance_grid")
+```
+
+```{r, fig.height=9, fig.width=6}
+map(TPH_CELLTYPES, function(target) {
+  activities <- top_activities(res_ctap_celltype, n = 15,
+                               within = tibble(celltype = target))
+  res_ctap_celltype %>%
+    filter(celltype == target) %>%
+    plot_activity_tiles(activities, title = target)
+}) %>% wrap_plots(ncol = 1)
+
+save_plot("amp_tph_ctap_tiles")
+```
+
+```{r, fig.height=5, fig.width=10}
+p1 <- plot_tph_comparison(res_ctap_celltype, contrast_filter = "TF",
+                    title = "TF CTAP vs control\nTph/Tfh subsets")
+p2 <- plot_tph_comparison(res_ctap_celltype, contrast_filter = "TB",
+                    title = "TB CTAP vs control\nTph/Tfh subsets")
+p1+p2
+save_plot("amp_tph_ctap_TF_scatter")
+```
+
+```{r, fig.height=5, fig.width=8}
+# The old panel also showed `IL7_IL27_c` and `IFNG_IL21_c`; neither survives as a
+# consensus activity in the final model (their member conditions now cluster
+# elsewhere), so they are dropped rather than substituted. `TGFB1_IL4` becomes
+# `TGFB1_IL4_c`.
+TF_PANEL <- c("IL27_TNF_c", "TGFB1_TNFSF18_c","IL6_TNFSF18_c", "TGFB1_IL4_c", "IL7_IL4_c", "TGFB1_IL21_c", "IL21_IL1B_c",
+              "IL27_IL21_c")
+
+plot_activity_ranges(
+  res_ctap_celltype %>%
+    filter(contrast == "TF", celltype %in% c(TPH_CELLTYPES, NAIVE_CELLTYPE)),
+  activities = with_component_singles(TF_PANEL),
+  group = "celltype",
+  order_by = annotate_results(tibble(component = with_component_singles(TF_PANEL)))$name,
+  title = "TF CTAP vs control:\ncombinations and their single ligands"
+)
+
+save_plot("amp_tph_comparison_TF_CTAP")
+```
+
+# Celltype identity
+
+Which activities separate the CD4 subsets irrespective of disease.
+
+```{r, fig.height=7, fig.width=10}
+plot_activity_tiles(res_celltype,
+                    activities = top_activities(res_celltype, n = 20),
+                    title = "Celltype-distinguishing activities (deleted-effect contrasts)")
+save_plot("amp_celltype_tiles")
+```

@@ -1,0 +1,387 @@
+---
+title: "SIG18 sPCA program annotation"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup}
+library(tidyverse)
+library(patchwork)
+library(viridisLite)
+library(ggrepel)
+library(ComplexHeatmap)
+library(circlize)
+library(RColorBrewer)
+library(ggpointdensity)
+library(scales)
+library(viridisLite)
+knitr::opts_chunk$set(echo = TRUE)
+set.seed(314)
+```
+
+```{r}
+# Repo-relative paths: inputs from imports_stable/, outputs to analysis_outs/<module>/
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "05_in_vitro_differentiation_RNAseq_SIG18")
+dir.create(file.path(outs_dir, "spca"), recursive = TRUE, showWarnings = FALSE)
+source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
+theme_set(theme_Publication())
+interaction_palette <- c("#808080",brewer.pal(5,"Dark2"))
+names(interaction_palette) <- c("none", "additive over saturation", "buffering", 
+                      "buffering complete", "synergy negative", "synergy positive")
+```
+
+# Goal
+
+-   remove components correlated with technical factors
+-   annotate sparse PCA programs based on ligands
+-   annotate interaction effects in sparse PCA programs
+
+# Import
+
+```{r}
+# import feature scores
+features <- readr::read_csv(file.path(imports_dir, "SIG18/analysis_outs/spca/zscore_degs/zscore_degs_unscaled_alpha10.0_sPCA_components.csv"))
+colnames(features)[-1] <- paste0("comp_",colnames(features)[-1])
+
+# import ligand component values
+codes <- readr::read_csv(file.path(imports_dir, "SIG18/analysis_outs/spca/zscore_degs/zscore_degs_alpha10.0_waggr_score.csv")) 
+codes <- codes %>%
+  separate(interaction, into = c("ligand1","ligand2","replicate","sex","well","library","project"), sep = "_") %>%
+  dplyr::select(-c(library, project)) %>%
+  mutate(interaction = paste0(ligand1, "_", ligand2))
+
+metadata <- read_csv(file.path(imports_dir, "SIG18/processing_outs/processed_metadata_SIG18.csv"))
+```
+
+```{r}
+interScored <- read_csv(file.path(imports_dir, "SIG18/analysis_outs/deg/res_interaction_scored_SIG18.csv")) %>%
+  dplyr::rename(name = gene, interaction = condition)
+```
+
+# Component Gene Numbers
+
+```{r, fig.height=4, fig.width=12}
+compNum <- features[,-1]
+compNum <- tibble(components = names(compNum),
+                  counts = colSums(compNum != 0))
+ggplot(compNum, aes(x = components, y = counts)) +
+  geom_col() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+compNum %>% nrow()
+```
+
+# LM for sPCA components
+
+To connect sparse PCA programs with specific ligands and technical factors, I will perform linear regression on scaled sparse PCA component scores with the following structure: scores = ligand1 + ligand2 + ligand1:ligand2 + replicate + total_reads_counts + seq_saturation. Th0 (`ligand1`) and none (`ligand2`) are the reference levels (aka intercept).
+
+P-value adjustment is performed across each globally.
+
+I will perform lm with a robust covariance model given the lm assumption violations.
+
+```{r}
+library(performance)
+library(broom)
+library(sandwich)   # robust vcov
+library(MASS)       # rlm
+library(quantreg)   # rq
+```
+
+```{r}
+# center/scale and clean codes
+mat <- codes %>%
+  left_join(metadata) %>%
+  mutate(sample = paste(ligand1,ligand2,replicate, total_reads_counts, seq_saturation, sep = "_")) %>%
+  dplyr::mutate(across(starts_with("comp_"), ~ as.numeric(scale(.x)))) %>%
+  column_to_rownames("sample") %>%
+  dplyr::select(starts_with("comp_")) %>%
+  as.matrix()
+
+# Extract metadata from rownames
+meta <- tibble(sample = rownames(mat)) %>%
+  separate(sample, into = c("ligand1", "ligand2", "replicate","total_reads_counts", "seq_saturation"), sep = "_", remove = FALSE) %>%
+  mutate(
+    replicate = factor(replicate),
+    ligand1   = fct_relevel(ligand1, "Th0"),
+    ligand2   = fct_relevel(ligand2, "none"),
+    total_reads_counts = as.vector(scale(as.numeric(total_reads_counts))),
+    seq_saturation = as.vector(scale(as.numeric(seq_saturation)))
+  )
+
+# Long format
+df <- as.data.frame(mat) %>%
+  rownames_to_column("sample") %>%
+  left_join(meta, by = "sample") %>%
+  pivot_longer(cols = starts_with("comp"), names_to = "component", values_to = "loading")
+```
+
+## OLS regression
+
+```{r}
+# ---------- Model 1: loading ~ ligand1 * ligand2 + replicate + total_reads_counts + seq_saturation ----------
+interaction_models <- df %>%
+  group_by(component) %>%
+  nest() %>%
+  mutate(
+    model  = map(data, ~ lm(loading ~ ligand1 * ligand2 + replicate + total_reads_counts + seq_saturation, data = .x)),
+    tidy   = map(model, tidy),
+    glance = map(model, glance),
+    augment= map(model, augment)
+  )
+# Coefficient table with BH adjust (by term across all components)
+lm_interaction <- interaction_models %>%
+  dplyr::select(component, tidy) %>%
+  unnest(tidy) %>%
+  mutate(p_adj = p.adjust(p.value, method = "BH"))
+```
+
+```{r}
+for(i in 1:length(interaction_models$model)){
+  print(check_heteroskedasticity(interaction_models$model[[i]]))
+}
+```
+
+Normality and heteroskedasticity assumptions are all violated in this data.
+
+## Regression with Robust SE
+
+Due to the OLS assumption violations, I will redo the regression using robust standard errors.
+
+```{r}
+# ---- Robust covariance helpers ----
+# Robust SE
+.robust_vcov <- function(mod) sandwich::vcovHC(mod, type = "HC3")
+
+.tidy_ols_hc <- function(mod) broom::tidy(mod, conf.int = TRUE, vcov = .robust_vcov(mod))
+
+# Robust estimation (Huber) — coefficients may shift if outliers matter
+.fit_rlm <- function(d, fml) MASS::rlm(fml, data = d, psi = psi.huber)
+.tidy_rlm <- function(mod) broom::tidy(mod)  # treat as sensitivity (SEs are large-sample)
+
+# =========================
+# Model 1: loading ~ ligand1 * ligand2 + replicate + total_reads_counts + seq_saturation
+# =========================
+interaction_models <- df %>%
+  group_by(component) %>%
+  nest() %>%
+  mutate(
+    model_ols   = map(data, ~ lm(loading ~ ligand1 * ligand2 + replicate + total_reads_counts + seq_saturation, data = .x)),
+    tidy_ols_hc = map(model_ols, .tidy_ols_hc),
+    glance_ols  = map(model_ols, glance),
+    augment_ols = map(model_ols, augment),
+
+    model_rlm   = map(data, ~ .fit_rlm(.x, loading ~ ligand1 * ligand2 + replicate + total_reads_counts + seq_saturation)),
+    tidy_rlm    = map(model_rlm, .tidy_rlm)
+  )
+
+# OLS+HC coefficient table with BH adjust globally
+lm_interaction <- interaction_models %>%
+  dplyr::select(component, tidy_ols_hc) %>%
+  unnest(tidy_ols_hc) %>%
+  ungroup() %>%
+  mutate(p_adj = p.adjust(p.value, method = "BH"))
+
+rlm_interaction <- interaction_models %>%
+  dplyr::select(component, tidy_rlm) %>%
+  unnest(tidy_rlm)
+```
+
+## Compare RLM to LM
+
+```{r}
+joint_interaction <- left_join(lm_interaction, rlm_interaction,
+                               by = c("component","term"),
+                               suffix = c("_lm","_rlm"))
+```
+
+```{r}
+joint_interaction %>%
+  ggplot(aes(x = estimate_lm, y = estimate_rlm)) +
+    geom_point()
+```
+
+It seems like the coefficients are pretty similar between the lm and robust lm so I will stick to lm
+
+## Identify replicate-driven components
+
+Here, I want to identify and remove components that are primarily driven by technical factors. This will specifically manifest as those that are highly associated with technical replicates
+
+### Visualize replicate associations
+
+```{r, fig.width=14, fig.height=5}
+lm_interaction %>%
+  #filter(p_adj < 0.01) %>%
+  mutate(is_replicate_association = grepl("replicate", term)) %>%
+  ggplot(aes(x = component, y = -log10(p_adj), color = is_replicate_association, size = abs(estimate))) +
+  geom_point() +
+  scale_color_manual(values = c("FALSE" = "black", "TRUE" = "red")) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5))
+```
+
+```{r, fig.width=14, fig.height=5}
+lm_interaction %>%
+  #filter(p_adj < 0.01) %>%
+  mutate(is_replicate_association = grepl("total_reads_counts", term)) %>%
+  ggplot(aes(x = component, y = -log10(p_adj), color = is_replicate_association, size = abs(estimate))) +
+  geom_point() +
+  scale_color_manual(values = c("FALSE" = "black", "TRUE" = "red")) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5))
+```
+
+```{r, fig.width=14, fig.height=5}
+lm_interaction %>%
+  filter(p_adj < 0.01) %>%
+  mutate(is_replicate_association = grepl("seq_saturation", term)) %>%
+  ggplot(aes(x = component, y = -log10(p_adj), color = is_replicate_association, size = abs(estimate))) +
+  geom_point() +
+  scale_color_manual(values = c("FALSE" = "black", "TRUE" = "red")) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5))
+```
+
+### Filter replicate-driven componets
+
+I will take a conservative approach and remove any component where the most significant association is replicate
+
+```{r}
+bad_rep_comps <- lm_interaction %>%
+  group_by(component) %>%
+  slice_min(p_adj, with_ties = FALSE) %>%
+  filter(grepl("replicate", term)) %>%
+  pull(component)
+
+bad_rep_comps
+```
+
+```{r}
+# make filtered lm tibble
+lm_interaction_filtered <- lm_interaction %>%
+  filter(!(component %in% bad_rep_comps))
+```
+
+## Classify interaction effects
+
+Here, I will take a similar approach as in the gene-level analysis and identify synergy, buffering and purely additive effects
+
+```{r}
+# make formated tibble
+l1 <- lm_interaction_filtered %>% 
+  filter(grepl("^ligand1", term)) %>% 
+  transmute(component,
+            ligand1 = sub("^ligand1", "", term),
+            estimate_ligand1 = estimate,
+            p_adj_ligand1 = p_adj)
+l2 <- lm_interaction_filtered %>% 
+  filter(grepl("^ligand2", term)) %>% 
+  transmute(component,
+            ligand2 = sub("^ligand2", "", term),
+            estimate_ligand2 = estimate,
+            p_adj_ligand2 = p_adj)
+int <- lm_interaction_filtered %>% 
+  filter(grepl("^ligand1.+:ligand2", term)) %>%
+  separate(term, c("l1","l2"), sep = ":", remove = FALSE) %>%
+  transmute(component,
+            ligand1 = sub("^ligand1", "", l1),
+            ligand2 = sub("^ligand2", "", l2),
+            interaction = paste0(ligand1, "_", ligand2),
+            estimate_interaction = estimate,
+            p_adj_interaction = p_adj)
+
+# assemble
+out <- int %>%
+  left_join(l1, by = c("component","ligand1"), relationship = "many-to-many") %>%
+  left_join(l2, by = c("component","ligand2"), relationship = "many-to-many") %>%
+  arrange(component, ligand1, ligand2)
+```
+
+```{r}
+lm_scored <- out %>%
+  mutate(estimate_total_interaction_model = (estimate_ligand1+estimate_ligand2+estimate_interaction),
+         interaction_score = case_when(p_adj_interaction > 0.1 ~ 0,
+                                       p_adj_interaction <= 0.1 ~ (estimate_interaction/(estimate_total_interaction_model)))) %>%
+    mutate(interaction_class = case_when(
+        # conditions are evaluated sequentially
+        p_adj_interaction <= 0.1 & estimate_total_interaction_model > 0 & interaction_score > 0 ~ "synergy positive",
+        p_adj_interaction <= 0.1 & estimate_total_interaction_model < 0 & interaction_score > 0 ~ "synergy negative",
+        p_adj_interaction <= 0.1 & interaction_score < 0 ~ "buffering",
+        p_adj_interaction > 0.1 ~ "none"
+        ))
+```
+
+### Merge with gene-level analysis
+
+Here I will merge the program features with the gene-level analysis of interaction effects which is more reliable
+
+```{r}
+spca_genes <- features %>%
+  pivot_longer(-gene, names_to = "spca_component", values_to = "loading") %>%
+  filter(loading != 0) %>%
+  arrange(spca_component,desc(loading))
+
+# pivot interscored so interaction class for each TNF interactor is a column
+gene_interactions <- interScored %>%
+  pivot_wider(id_cols = c(name),
+              names_from = ligand1,
+              names_prefix = "interaction_",
+              values_from = interaction_class) 
+
+# create annotated spca genes file
+spca_genes_anno <- spca_genes %>%
+  left_join(gene_interactions, by = join_by(gene == name))
+```
+
+
+```{r}
+interScored_minimal <- interScored %>%
+  dplyr::select(name, interaction, interaction_class) %>%
+  mutate(interaction = gsub("-","_", interaction)) %>%
+  dplyr::rename(interaction_class_gene = interaction_class)
+
+# create annotated lm_scored with proportion of synergy and buffering
+# genes out of total for every component and interaction
+lm_scored_anno <- lm_scored %>%
+  left_join(spca_genes, by = c("component" = "spca_component"), relationship = "many-to-many") %>%
+  left_join(interScored_minimal, by = c("gene" = "name","interaction")) %>%
+  group_by(across(-c(gene, loading, interaction_class_gene))) %>%
+  count(interaction_class_gene, name = "n") %>%
+  mutate(prop = n / sum(n))  %>%
+  ungroup() %>%
+  filter(interaction_class_gene != "none") %>%
+  pivot_wider(id_cols = -n,
+              names_from = interaction_class_gene,
+              names_prefix = "freq_",
+              values_from = prop,
+              values_fill = 0)
+```
+
+# Export
+
+```{r}
+# export loadings of components with gene-level synergies
+write_csv(spca_genes_anno, file.path(outs_dir, "spca/zscore_degs_alpha10.0_sPCA_loadings.csv"))
+```
+
+```{r}
+write_csv(lm_interaction, file.path(outs_dir, "spca/lm_fit_zscore_degs_alpha10.0_sPCA.csv"))
+write_csv(lm_interaction_filtered, file.path(outs_dir, "spca/lm_fit_zscore_degs_alpha10.0_sPCA_clean.csv"))
+write_csv(lm_scored_anno, file.path(outs_dir, "spca/lm_scored_zscore_degs_alpha10.0_sPCA_clean.csv"))
+```
+
+
+
+
+
+
+
+

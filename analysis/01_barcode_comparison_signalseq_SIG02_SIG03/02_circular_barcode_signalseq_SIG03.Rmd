@@ -1,0 +1,318 @@
+---
+title: "SIG03 oBC Direct Amp Barcode Analysis (CD4)"
+author: "Eric Y. Wang"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+Circular barcode analysis on the HPC scanpy outputs
+(`SIG03_oBCDirect_full.h5mu`, the same object loaded in `03_linear_vs_circular_counts_SIG02_SIG03.ipynb`).
+Only CD4 T cells are analyzed; the splenocyte and Jurkat sections are dropped.
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(Matrix)
+library(rhdf5)
+library(ggplot2)
+library(cowplot)
+library(yardstick)
+library(ggpointdensity)
+library(RColorBrewer)
+library(patchwork)
+knitr::opts_chunk$set(echo = TRUE)
+
+# Repo-relative paths: inputs from imports_stable/, outputs to analysis_outs/
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "01_barcode_comparison_signalseq_SIG02_SIG03")
+```
+
+```{r}
+source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
+source(file.path(repo_dir, "functions/r_custom/scRNA_seq_analysis_functions.R"))
+theme_set(theme_Publication())
+```
+
+### [Import Data]{.underline}
+
+The `.h5mu` is read directly with `rhdf5` (reticulate + muon fails on the cluster
+because of an OpenSSL library conflict between R and the `scanpy_standard2` env).
+
+```{r}
+OUT_DIR <- file.path(imports_dir, "SIG03/scanpy_outs")
+FULL_H5MU <- file.path(OUT_DIR, "SIG03_oBCDirect_full.h5mu")
+
+ANALYSIS_OUTS <- file.path(outs_dir, "01_barcode_analysis_oBCDirect")
+dir.create(ANALYSIS_OUTS, recursive = TRUE, showWarnings = FALSE)
+
+# read an AnnData obs column (categoricals are stored as 0-based codes + categories)
+read_obs_col <- function(file, mod, col) {
+  path <- paste0("/mod/", mod, "/obs/", col)
+  if (h5readAttributes(file, path)[["encoding-type"]] == "categorical") {
+    codes <- as.integer(h5read(file, paste0(path, "/codes")))
+    cats <- as.character(h5read(file, paste0(path, "/categories")))
+    codes[codes < 0] <- NA  # -1 = missing; must be NA (not 0) so indexing stays aligned
+    return(cats[codes + 1])
+  }
+  as.vector(h5read(file, path))
+}
+
+# read a csr_matrix (cells x features) as a features x cells dgCMatrix (Seurat orientation)
+read_csr <- function(file, path, features, cells) {
+  sparseMatrix(
+    i = as.integer(h5read(file, paste0(path, "/indices"))),
+    p = as.integer(h5read(file, paste0(path, "/indptr"))),
+    x = as.numeric(h5read(file, paste0(path, "/data"))),
+    dims = c(length(features), length(cells)),
+    dimnames = list(features, cells),
+    index1 = FALSE
+  )
+}
+
+cells <- as.character(h5read(FULL_H5MU, "/mod/bc/obs/_index"))
+bc_features <- as.character(h5read(FULL_H5MU, "/mod/bc/var/_index"))
+bcCounts <- read_csr(FULL_H5MU, "/mod/bc/layers/counts", bc_features, cells)
+
+stopifnot(identical(cells, as.character(h5read(FULL_H5MU, "/mod/rna/obs/_index"))))
+metadataAll <- tibble(
+  cell_BC = cells,
+  celltype = read_obs_col(FULL_H5MU, "rna", "celltype"),
+  timepoint = read_obs_col(FULL_H5MU, "rna", "timepoint"),
+  titer = read_obs_col(FULL_H5MU, "rna", "titer"),
+  nCount_RNA = read_obs_col(FULL_H5MU, "rna", "total_counts"),
+  nCount_BC = colSums(bcCounts)
+)
+h5closeAll()
+```
+
+Subset to CD4 cells and rebuild the legacy `hash.ID` labels (`CD4-{timepoint}-{titer}`).
+
+```{r}
+TITER_ORDER <- c("2e11", "6e10", "2e10", "6e9", "0")
+TIMEPOINTS <- c("6h", "22h")
+HASH_ORDER <- as.vector(outer(TITER_ORDER, TIMEPOINTS, function(ti, tp) paste0("CD4-", tp, "-", ti)))
+
+metadata <- metadataAll %>%
+  filter(celltype == "CD4", timepoint %in% TIMEPOINTS, titer %in% TITER_ORDER) %>%
+  mutate(hash.ID = factor(paste0("CD4-", timepoint, "-", titer), HASH_ORDER))
+
+countsCD4 <- bcCounts[, metadata$cell_BC]
+
+metadata %>% count(hash.ID)
+```
+
+### [Visualize Barcode Distributions]{.underline}
+
+#### CD4 Barcodes
+
+```{r}
+countData <- tibble(log1p_total_count = log1p(metadata$nCount_RNA),
+                    log1p_oBC_count = log1p(metadata$nCount_BC))
+
+countData %>%
+  ggplot(aes(x = log1p_oBC_count, y = log1p_total_count)) +
+    geom_pointdensity() +
+    scale_color_viridis_c() +
+    theme(aspect.ratio = 1)
+```
+
+```{r}
+BCdata <- countsCD4 %>%
+  as.matrix() %>%
+  as_tibble(rownames = "BC") %>%
+  pivot_longer(-BC, names_to = "cell_BC", values_to = "counts") %>%
+  mutate(log10counts = log10(counts + 1)) %>%
+  left_join(metadata, by = "cell_BC")
+
+# overlaid per-dose histograms for one barcode at one timepoint
+plot_bc_overlay <- function(bc, tp) {
+  hashes <- paste0("CD4-", tp, "-", TITER_ORDER)
+  BCdata %>%
+    filter(BC == bc, hash.ID %in% hashes) %>%
+    ggplot(aes(x = log10counts, fill = hash.ID)) +
+    geom_histogram(aes(y = after_stat(density), group = hash.ID),
+                   bins = 100, alpha = 0.75, position = "identity") +
+    geom_density(aes(y = after_stat(density), group = hash.ID),
+                 alpha = 0.25, color = "black", linewidth = 1) +
+    scale_fill_manual(values = setNames(c(brewer.pal(8, "Dark2")[1:4], "grey50"), hashes)) +
+    theme(legend.position = "none", aspect.ratio = 0.5) +
+    ggtitle(paste(bc, tp))
+}
+```
+
+```{r, fig.height=10, fig.width=15}
+plot_bc_overlay("p139-BC4", "6h") + plot_bc_overlay("p139-BC5", "6h") +
+  plot_bc_overlay("p139-BC4", "22h") + plot_bc_overlay("p139-BC5", "22h") +
+  plot_layout(ncol = 2)
+ggsave(file.path(ANALYSIS_OUTS, "barcode_histogram_CD4_overlay.pdf"))
+```
+
+```{r}
+# get mean counts for barcodes
+BCdata %>%
+  filter(BC %in% c("p139-BC4")) %>%
+  filter(hash.ID %in% c("CD4-6h-2e11","CD4-6h-6e10","CD4-6h-2e10","CD4-6h-6e9","CD4-6h-0")) %>%
+  group_by(hash.ID) %>%
+  summarise(mean = mean(counts))
+```
+
+```{r}
+expressionData <- tibble(cell_bc = metadata$cell_BC,
+                         hash.ID = metadata$hash.ID,
+                         BC4 = countsCD4["p139-BC4",],
+                         BC5 = countsCD4["p139-BC5",])
+
+# BC4 vs BC5 density scatter for one hash.ID
+plot_bc4_bc5 <- function(hash, title) {
+  expressionData %>%
+    filter(hash.ID %in% hash) %>%
+    ggplot(aes(x = log(BC4 + 1), y = log(BC5 + 1))) +
+      geom_pointdensity() +
+      scale_color_viridis_c() +
+      theme(aspect.ratio = 1) +
+      xlim(0,10) +
+      ylim(0,10) +
+      ggtitle(title)
+}
+```
+
+```{r, fig.width=10, fig.height=10}
+plot_grid(plot_bc4_bc5("CD4-6h-2e11", "2e11 LP/mL 6h"),
+          plot_bc4_bc5("CD4-6h-6e10", "6e10 LP/mL 6h"),
+          plot_bc4_bc5("CD4-6h-2e10", "2e10 LP/mL 6h"),
+          plot_bc4_bc5("CD4-6h-6e9",  "6e9 LP/mL 6h"),
+          ncol = 2)
+ggsave(file.path(ANALYSIS_OUTS, "bc4_bc5_6h_density_plot.pdf"))
+```
+
+```{r, fig.width=10, fig.height=10}
+plot_grid(plot_bc4_bc5("CD4-22h-2e11", "2e11 LP/mL 22h"),
+          plot_bc4_bc5("CD4-22h-6e10", "6e10 LP/mL 22h"),
+          plot_bc4_bc5("CD4-22h-2e10", "2e10 LP/mL 22h"),
+          plot_bc4_bc5("CD4-22h-6e9",  "6e9 LP/mL 22h"),
+          ncol = 2)
+ggsave(file.path(ANALYSIS_OUTS, "bc4_bc5_22h_density_plot.pdf"))
+```
+
+Get frequency of assignments at a cutoff of ln(BC)
+```{r}
+expressionData %>%
+  mutate(pos = ifelse(log(BC5+1) > 4 & log(BC4+1) > 4,T,F)) %>%
+  group_by(hash.ID) %>%
+  summarise(freq = sum(pos)/n())
+```
+
+### [Barcode Classification]{.underline}
+
+For each barcode x timepoint, each transduced dose is scored against the matched
+`0`-titer control using raw barcode UMIs as the predictor.
+
+```{r}
+# one test dataset per dose: that dose (positive) vs the matched 0 control (negative)
+make_test_data <- function(bc, tp) {
+  doses <- paste0("CD4-", tp, "-", setdiff(TITER_ORDER, "0"))
+  neg <- paste0("CD4-", tp, "-0")
+  testDataList <- map(setNames(doses, doses), function(dose) {
+    tibble(hash.ID = metadata$hash.ID,
+           umi_counts = countsCD4[bc,]) %>%
+      filter(hash.ID %in% c(dose, neg)) %>%
+      mutate(label = case_when(hash.ID == neg ~ "negative",
+                               hash.ID %in% doses ~ "positive")) %>%
+      mutate(label = factor(label, c("positive","negative")))
+  })
+  testDataList
+}
+
+# AUC table (written to csv) + ROC and PR curves
+run_classification <- function(bc, tp) {
+  testDataList <- make_test_data(bc, tp)
+  bc_short <- str_remove(bc, "p139-")
+
+  results <- imap_dfr(testDataList, function(data, name) {
+    data %>%
+      roc_auc(truth = label, umi_counts) %>%
+      mutate(group = name)
+  })
+  write_csv(results, file.path(ANALYSIS_OUTS, paste0("umi_cutoff_auc_metrics_", bc_short, "_", tp, ".csv")))
+
+  curve_data <- imap_dfr(testDataList, function(data, name) {
+    roc <- roc_curve(data, truth = label, umi_counts) %>%
+      mutate(type = "ROC")
+    pr <- pr_curve(data, truth = label, umi_counts) %>%
+      mutate(type = "PR")
+    bind_rows(roc, pr) %>%
+      mutate(group = name)
+  }) %>%
+    mutate(group = factor(group, names(testDataList)))
+
+  roc <- curve_data %>%
+    filter(type == "ROC") %>%
+    ggplot(aes(x = 1 - specificity, y = sensitivity, color = group)) +
+    geom_path(linewidth = 1) +
+    scale_color_brewer(palette = "Dark2") +
+    labs(title = paste("ROC", tp, bc_short), x = "False Positive Rate", y = "True Positive Rate") +
+    theme(aspect.ratio = 1) +
+    coord_cartesian(xlim = c(0, 1), ylim = c(0, 1))
+
+  pr <- curve_data %>%
+    filter(type == "PR") %>%
+    ggplot(aes(x = recall, y = precision, color = group)) +
+    geom_path(linewidth = 1) +
+    scale_color_brewer(palette = "Dark2") +
+    labs(title = paste("PR Curve", tp, bc_short), x = "Recall", y = "Precision") +
+    theme(aspect.ratio = 1) +
+    coord_cartesian(xlim = c(0.5, 1), ylim = c(0.5, 1))
+
+  list(results = results, roc = roc, pr = pr)
+}
+```
+
+#### Barcode 4 Recall
+
+```{r}
+bc4_6h <- run_classification("p139-BC4", "6h")
+bc4_22h <- run_classification("p139-BC4", "22h")
+bind_rows(bc4_6h$results, bc4_22h$results)
+```
+
+#### Barcode 5 Recall
+
+```{r}
+bc5_6h <- run_classification("p139-BC5", "6h")
+bc5_22h <- run_classification("p139-BC5", "22h")
+bind_rows(bc5_6h$results, bc5_22h$results)
+```
+
+#### Visualize
+
+```{r, fig.height=12, fig.width=12}
+plot_grid(bc4_6h$pr, bc4_22h$pr, bc5_6h$pr, bc5_22h$pr)
+ggsave(file.path(ANALYSIS_OUTS, "pr_curves.pdf"))
+plot_grid(bc4_6h$roc, bc4_22h$roc, bc5_6h$roc, bc5_22h$roc)
+ggsave(file.path(ANALYSIS_OUTS, "roc_curves.pdf"))
+```
+
+```{r}
+metadata %>%
+  group_by(hash.ID) %>%
+  summarise(count = n())
+```
+
+QC: library size distribution per sample.
+
+```{r, fig.height=5, fig.width=12}
+metadata %>%
+  ggplot(aes(color=hash.ID, x=nCount_RNA, fill=hash.ID)) +
+    geom_density() +
+    scale_x_log10() +
+    facet_wrap(~hash.ID, ncol = 5)
+```

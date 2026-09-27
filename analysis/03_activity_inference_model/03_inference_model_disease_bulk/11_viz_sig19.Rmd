@@ -1,0 +1,251 @@
+---
+title: "Ligand Activity Figures: SIG19 (Treg depletion + cytokine blockade)"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE)
+source("viz_helpers.R")
+```
+
+# Import
+
+Activity scores and regression results for the SIG19 iLN experiment.
+
+```{r}
+SIG19_KEYS <- c("treatment", "mouse", "cage", "sex")
+TREATMENTS <- c("isotype", "DTA1", "GK1.5-BGo", "DTA1-BGo", "GK1.5-IL4", "DTA1-IL4")
+
+sig19 <- load_activity_scores("sig19_iln", SIG19_KEYS) %>%
+  mutate(treatment = factor(treatment, TREATMENTS))
+
+sig19_celltype <- load_activity_scores("sig19_iln_celltype", c(SIG19_KEYS, "leiden_0.5")) %>%
+  rename(leiden = "leiden_0.5") %>%
+  mutate(treatment = factor(treatment, TREATMENTS),
+         celltype = factor(paste0("cluster_",leiden)))
+
+# contrast labels come back as "<treatment> - isotype", sometimes parenthesized
+clean_contrast <- function(res) {
+  mutate(res, contrast = str_remove(contrast, " - isotype") %>% str_remove_all("[()]"))
+}
+
+res_treatment <- read_csv(file.path(RES_IN_DIR, "sig19_iln_treatment.csv"),
+                          show_col_types = FALSE) %>% clean_contrast()
+res_synergy <- read_csv(file.path(RES_IN_DIR, "sig19_iln_treatment_synergy.csv"),
+                        show_col_types = FALSE)
+res_celltype <- read_csv(file.path(RES_IN_DIR, "sig19_iln_celltype.csv"),
+                         show_col_types = FALSE) %>%
+  mutate(contrast = str_remove(contrast, " effect") %>% str_remove_all("[()]"))
+res_celltype_pairs <- read_csv(file.path(RES_IN_DIR, "sig19_iln_celltype_pairs.csv"),
+                         show_col_types = FALSE) %>%
+  mutate(contrast = str_remove(contrast, " effect") %>% str_remove_all("[()]"))
+res_treatment_celltype <- read_csv(file.path(RES_IN_DIR, "sig19_iln_celltype_treatment.csv"),
+                                   show_col_types = FALSE) %>% clean_contrast()
+res_synergy_celltype <- read_csv(file.path(RES_IN_DIR, "sig19_iln_celltype_treatment_synergy.csv"),
+                                 show_col_types = FALSE)
+
+# clusters 8 and 12 are Tregs; excluded from the treatment panels below because
+# the DTA1 arm depletes them, so their activity shifts are not comparable
+TREG_CLUSTERS <- c("cluster_8", "cluster_12")
+TCONV_ORDER <- paste0("cluster_", c(0:7, 9:11))
+```
+
+# Model fit
+
+```{r, fig.height=10, fig.width=12}
+(plot_model_fit("sig19_iln", "whole iLN") + plot_model_fit("sig19_iln_celltype", "per cluster")) /
+  (plot_alpha_fit("sig19_iln", "whole iLN") + plot_alpha_fit("sig19_iln_celltype", "per cluster"))
+```
+
+# Treatment associations
+
+```{r, fig.height=4, fig.width=8}
+plot_volcano(res_treatment %>% filter(contrast %in% c("DTA1","GK1.5-BGo","DTA1-BGo")), facet = "contrast", title = "Activity change vs isotype")
+
+save_plot("sig19_treatment_bulk_BGo_volcano")
+```
+
+```{r, fig.height=4, fig.width=8}
+plot_volcano(res_treatment %>% filter(contrast %in% c("DTA1","GK1.5-IL4","DTA1-IL4")), facet = "contrast", title = "Activity change vs isotype")
+
+save_plot("sig19_treatment_bulk_IL4_volcano")
+```
+
+```{r, fig.height=4, fig.width=12}
+plot_volcano(res_treatment %>% mutate(contrast = factor(contrast, c("isotype","DTA1","GK1.5-IL4","DTA1-IL4","GK1.5-BGo","DTA1-BGo"))), facet = "contrast", title = "Activity change vs isotype", ncol = 5)
+
+save_plot("sig19_treatment_bulk_volcano")
+```
+
+Per-mouse activity scores for the activities the antibodies were expected to move.
+`IL4_c` and `TNFSF18_c` are this model's names for the single IL4 and TNF-family
+consensus activities.
+
+```{r, fig.width=12, fig.height=6}
+plot_activity_by_treatment <- function(activity) {
+  label <- load_annotations() %>% filter(annotation == activity) %>% pull(name)
+  sig19 %>%
+    ggplot(aes(x = treatment, y = .data[[activity]], color = treatment)) +
+    geom_point(alpha = 0.7, shape = 21, fill = "white") +
+    stat_summary(fun = mean, fun.min = mean, fun.max = mean,
+                 geom = "crossbar", width = 0.75) +
+    scale_color_brewer(palette = "Dark2") +
+    #ylim(-3, 4) +
+    theme(aspect.ratio = 1, axis.text.x = element_blank()) +
+    labs(title = label, x = "", y = "ligand activity")
+}
+
+map(c("TGFB1", "IL4_c", "TNFSF18_c", "TGFB1_TNFSF18_c", "IL4_TNFSF18_c"),
+    plot_activity_by_treatment) %>%
+  wrap_plots(ncol = 3)
+
+save_plot("sig19_treatment_activity_points")
+```
+
+# Celltype associations
+
+```{r, fig.height=5, fig.width=6}
+res_celltype %>%
+  filter(padj < SIG_CUTOFF, !contrast %in% TREG_CLUSTERS) %>%
+  filter(component %in% c("TNFSF18_c", "TGFB1", "TGFB1_TNFSF18_c")) %>%
+  annotate_results() %>%
+  ggplot(aes(x = contrast, y = name)) +
+  geom_point(aes(size = -log10(padj), fill = estimate), shape = 21) +
+  scale_fill_distiller(palette = "RdBu", limits=c(-2.2,2.2)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  coord_equal() +
+  labs(title = "Baseline activity by cluster", x = "", y = "")
+
+save_plot("sig19_tgfb_tnf_celltype_dotplot")
+```
+
+```{r, fig.height=5, fig.width=6}
+res_celltype %>%
+  filter(padj < SIG_CUTOFF, !contrast %in% TREG_CLUSTERS) %>%
+  filter(component %in% c("TNFSF18_c", "IL4_c", "IL4_TNFSF18_c")) %>%
+  annotate_results() %>%
+  ggplot(aes(x = contrast, y = name)) +
+  geom_point(aes(size = -log10(padj), fill = estimate), shape = 21) +
+  scale_fill_distiller(palette = "RdBu", limits=c(-2.2,2.2)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  coord_equal() +
+  labs(title = "Baseline activity by cluster", x = "", y = "")
+
+save_plot("sig19_IL4_tnf_celltype_dotplot")
+```
+
+```{r}
+res_celltype_pairs %>%
+  filter(contrast == "cluster_1 - cluster_3") %>%
+  mutate(component_label = ifelse(component %in% c("TGFB1","TGFB1_TNFSF18_c"), component,"")) %>%
+  mutate(estimate = -estimate) %>% # flip sign
+  ggplot(aes(x = estimate, y = -log10(padj))) +
+  geom_point() +
+  geom_text_repel(aes(label = component_label)) +
+  geom_hline(yintercept = 1, color = "red", linetype = "dashed") +
+  xlim(-2.5, 2.5) +
+  theme(aspect.ratio = 1) +
+  xlab("Estimate (Cluster 3 vs Cluster 1)")
+
+```
+
+
+```{r}
+# treatment effect per cluster, for one antibody arm and its related activities
+plot_arm_by_cluster <- function(treatments, activities, limits) {
+  res_treatment_celltype %>%
+    filter(contrast %in% treatments, !celltype %in% TREG_CLUSTERS,
+           component %in% activities) %>%
+    annotate_results() %>%
+    mutate(cluster = factor(str_remove(celltype, "cluster_"),
+                            str_remove(TCONV_ORDER, "cluster_"))) %>%
+    ggplot(aes(x = cluster, y = contrast)) +
+    geom_tile(aes(fill = estimate)) +
+    geom_text(aes(label = sig_stars(padj)), vjust = 0.8, size = 2.5) +
+    scale_fill_distiller(palette = "RdBu", limits = limits) +
+    facet_wrap(~name, ncol = 1) +
+    coord_equal()+
+    labs(x = "leiden cluster", y = "")
+}
+```
+
+```{r, fig.height=4, fig.width=5}
+plot_arm_by_cluster(c("GK1.5-BGo", "DTA1-BGo", "DTA1"),
+                    c("TGFB1", "TGFB1_TNFSF18_c", "TNFSF18_c"),
+                    limits = c(-2, 2))
+
+save_plot("sig19_BGo_arm_by_cluster")
+```
+
+```{r, fig.height=4, fig.width=5}
+plot_arm_by_cluster(c("GK1.5-IL4", "DTA1-IL4", "DTA1"),
+                    c("IL4_c", "IL4_TNFSF18_c", "TNFSF18_c"),
+                    limits = c(-5, 5))
+
+save_plot("sig19_IL4_arm_by_cluster")
+```
+
+# Activity scores by treatment within a cluster
+
+Per-mouse `TGFB1_TNFSF18_c` activity scores restricted to `cluster_2`, across
+treatment groups.
+
+```{r, fig.width=4, fig.height=5}
+label <- load_annotations() %>% filter(annotation == "TGFB1_TNFSF18_c") %>% pull(name)
+
+sig19_celltype %>%
+  filter(treatment %in% c("isotype","DTA1-BGo")) %>%
+  filter(leiden %in% c("0","2","5","1","3")) %>%
+  mutate(leiden = factor(leiden, c("0","2","5","1","3"))) %>%
+  ggplot(aes(x = leiden, y = TGFB1_TNFSF18_c, color = treatment)) +
+  geom_boxplot(outlier.shape = NA) +
+  #geom_jitter(width = 0.15, alpha = 0.7) +
+  scale_color_brewer(palette = "Dark2") +
+  theme(aspect.ratio = 1.5) +
+  labs(title = paste(label, "\nacross clusters"), x = "", y = "ligand activity")
+
+save_plot("sig19_TGFB1_TNFSF18_boxplot")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

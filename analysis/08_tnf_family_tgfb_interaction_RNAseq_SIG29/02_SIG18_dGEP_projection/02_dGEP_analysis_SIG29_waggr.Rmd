@@ -1,0 +1,526 @@
+---
+title: "SIG29 dGEP Analysis: waggr"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+---
+
+# Goal
+
+Downstream analysis of the SIG18 dGEP scores projected onto SIG29
+(see `01_dGEP_scoring_SIG29.ipynb`).
+
+# Import
+
+```{r setup}
+library(tidyverse)
+library(patchwork)
+library(broom)
+library(sandwich)
+library(ggrepel)
+library(RColorBrewer)
+library(pheatmap)
+library(gridExtra)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# Repo-relative paths: inputs from imports_stable/, outputs to analysis_outs/<module>/
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "08_tnf_family_tgfb_interaction_RNAseq_SIG29")
+source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
+theme_set(theme_Publication())
+
+# ---- config ----
+score_method <- "waggr"
+sig_alpha    <- 0.1
+proj_dir <- file.path(imports_dir, "SIG29/analysis_outs/inference_SIG18")  # waggr scores from 01_dGEP_scoring_SIG29
+out_dir  <- file.path(outs_dir, "inference_SIG18")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# SIG18 sPCA/dGEP outputs this analysis reads (from analysis/05_in_vitro_differentiation_RNAseq_SIG18)
+sig18_dir             <- file.path(imports_dir, "SIG18")
+sig18_lm_scored_clean <- file.path(sig18_dir, "analysis_outs/spca/lm_scored_zscore_degs_alpha10.0_sPCA_clean.csv")
+sig18_lm_fit          <- file.path(sig18_dir, "analysis_outs/spca/lm_fit_zscore_degs_alpha10.0_sPCA.csv")
+```
+
+```{r}
+obs <- read_csv(file.path(proj_dir, "waggr_scored_obs_SIG29.csv"))
+
+# score feature columns (SIG18_*) and a tidy condition factor (none_none = reference)
+feature_cols <- grep("^SIG18_", colnames(obs), value = TRUE)
+
+obs <- obs %>%
+  mutate(
+    cond      = paste0(ligand1, "_", ligand2),
+    cond      = relevel(factor(cond), ref = "none_none"),
+    replicate = factor(replicate)
+  )
+
+# map each feature -> program id
+feature_map <- tibble(feature = feature_cols) %>%
+  mutate(program = str_extract(feature, "comp_[0-9]+"))
+
+cat(score_method, ":", length(feature_cols), "SIG18 program features\n")
+```
+
+# Interaction effects (order-independent LM)
+
+Because `ligand1`/`ligand2` are arbitrary slots (the same ligand could in
+principle appear in either slot, and SIG29's own combos are always
+`TGFb_<member>`), each program score is regressed on **slot-independent**
+ligand-presence indicators (`lig_<L>`) plus one indicator per **unordered**
+ligand pair (`pair_<A>_<B>`), controlling for donor (`replicate`), with
+`none_none` as the reference: `score ~ sum(lig_<L>) + sum(pair_<A>_<B>) +
+replicate`. `pair_<A>_<B>` is the symmetric interaction term; robust (HC3)
+SEs are used and p-values are BH-adjusted.
+
+```{r}
+# per-sample scaled program scores (one row per ligand1_ligand2_replicate)
+score_mat <- obs %>%
+  mutate(sample = paste(ligand1, ligand2, replicate, sep = "_")) %>%
+  mutate(across(all_of(feature_cols), ~ as.numeric(scale(.x)))) %>%
+  column_to_rownames("sample") %>%
+  dplyr::select(all_of(feature_cols)) %>%
+  as.matrix()
+
+# ---- order-independent ligand design ----
+# per-sample ligand membership (drop "none")
+samp_lig <- obs %>%
+  mutate(sample = paste(ligand1, ligand2, replicate, sep = "_")) %>%
+  dplyr::select(sample, ligand1, ligand2) %>%
+  pivot_longer(c(ligand1, ligand2), values_to = "ligand") %>%
+  filter(ligand != "none") %>%
+  distinct(sample, ligand)
+
+# main-effect indicators: lig_<LIGAND> = 1 if present in either slot
+main_ind <- samp_lig %>%
+  transmute(sample, term = paste0("lig_", ligand), val = 1L) %>%
+  pivot_wider(names_from = term, values_from = val, values_fill = 0L)
+
+# unordered pairwise indicators: pair_<A>_<B> (A,B sorted) = 1 if both present
+pair_ind <- samp_lig %>%
+  group_by(sample) %>%
+  filter(n() == 2) %>%
+  summarise(term = paste0("pair_", paste(sort(ligand), collapse = "_")), .groups = "drop") %>%
+  mutate(val = 1L) %>%
+  pivot_wider(names_from = term, values_from = val, values_fill = 0L)
+
+# replicate (donor/batch)
+rep_df <- obs %>%
+  mutate(sample = paste(ligand1, ligand2, replicate, sep = "_")) %>%
+  distinct(sample, replicate)
+
+# per-sample design + symmetric model formula (none_none = reference)
+design <- tibble(sample = rownames(score_mat)) %>%
+  left_join(main_ind, by = "sample") %>%
+  left_join(pair_ind, by = "sample") %>%
+  left_join(rep_df, by = "sample") %>%
+  mutate(across(c(starts_with("lig_"), starts_with("pair_")), ~ replace_na(.x, 0L)))
+
+pred_terms    <- design %>% dplyr::select(starts_with("lig_"), starts_with("pair_")) %>% names()
+model_formula <- reformulate(c(pred_terms, "replicate"), response = "score")
+
+# long format: scaled program scores joined to the symmetric design
+int_df <- as.data.frame(score_mat) %>%
+  rownames_to_column("sample") %>%
+  pivot_longer(cols = all_of(feature_cols), names_to = "feature", values_to = "score") %>%
+  left_join(design, by = "sample")
+```
+
+OLS fit with robust (HC3) SEs per program; BH adjustment across all terms.
+
+```{r}
+.robust_vcov <- function(mod) sandwich::vcovHC(mod, type = "HC3")
+.tidy_ols_hc <- function(mod) broom::tidy(mod, conf.int = TRUE, vcov = .robust_vcov)
+
+# models are kept (`lm_models`) so per-condition contrasts can be computed from
+# the same fits further below (see "Condition effects")
+lm_models <- int_df %>%
+  group_by(feature) %>%
+  nest() %>%
+  mutate(model = map(data, ~ lm(model_formula, data = .x))) %>%
+  ungroup()
+
+lm_int <- lm_models %>%
+  mutate(tidy = map(model, .tidy_ols_hc)) %>%
+  dplyr::select(feature, tidy) %>%
+  unnest(tidy) %>%
+  left_join(feature_map, by = "feature") %>%
+  mutate(p_adj = p.adjust(p.value, method = "BH"))
+
+write_csv(lm_int, file.path(out_dir, paste0("scoreInteractionLM_", score_method, "_SIG29.csv")))
+```
+
+## Remove replicate-driven programs
+
+```{r}
+# drop any program whose most significant association is a replicate (donor) term
+bad_rep_feats <- lm_int %>%
+  group_by(feature) %>%
+  slice_min(p_adj, with_ties = FALSE) %>%
+  filter(grepl("replicate", term)) %>%
+  pull(feature)
+
+lm_int_filtered <- lm_int %>% filter(!(feature %in% bad_rep_feats))
+length(bad_rep_feats)
+```
+
+## Classify interaction effects
+
+```{r}
+# single-ligand main effects (slot-independent: lig_<LIGAND>)
+main_eff <- lm_int_filtered %>%
+  filter(grepl("^lig_", term)) %>%
+  transmute(feature, program, ligand = sub("^lig_", "", term), estimate, p_adj)
+l1 <- main_eff %>% transmute(feature, ligand1 = ligand,
+                             estimate_ligand1 = estimate, p_adj_ligand1 = p_adj)
+l2 <- main_eff %>% transmute(feature, ligand2 = ligand,
+                             estimate_ligand2 = estimate, p_adj_ligand2 = p_adj)
+
+# map each unordered pair back to its canonical ligand1_ligand2 label (metadata order)
+combo_canon <- obs %>%
+  dplyr::filter(ligand1 != "none", ligand2 != "none") %>%
+  dplyr::distinct(ligand1, ligand2) %>%
+  dplyr::mutate(pair = purrr::map2_chr(ligand1, ligand2,
+                                       ~ paste(sort(c(.x, .y)), collapse = "_")))
+
+# unordered pairwise interaction effects (pair_<A>_<B>)
+int <- lm_int_filtered %>%
+  filter(grepl("^pair_", term)) %>%
+  mutate(pair = sub("^pair_", "", term)) %>%
+  left_join(combo_canon, by = "pair") %>%
+  transmute(feature, program, ligand1, ligand2,
+            interaction = paste0(ligand1, "_", ligand2),
+            estimate_interaction = estimate, p_adj_interaction = p_adj)
+
+lm_int_scored <- int %>%
+  left_join(l1, by = c("feature", "ligand1"), relationship = "many-to-many") %>%
+  left_join(l2, by = c("feature", "ligand2"), relationship = "many-to-many") %>%
+  mutate(
+    estimate_total    = estimate_ligand1 + estimate_ligand2 + estimate_interaction,
+    interaction_score = case_when(p_adj_interaction > sig_alpha ~ 0,
+                                  TRUE ~ estimate_interaction / estimate_total),
+    interaction_class = case_when(
+      p_adj_interaction <= sig_alpha & estimate_total > 0 & interaction_score > 0 ~ "synergy positive",
+      p_adj_interaction <= sig_alpha & estimate_total < 0 & interaction_score > 0 ~ "synergy negative",
+      p_adj_interaction <= sig_alpha & interaction_score < 0                      ~ "buffering",
+      TRUE                                                                        ~ "none")) %>%
+  arrange(interaction, feature)
+
+write_csv(lm_int_scored, file.path(out_dir, paste0("scoreInteractionScored_", score_method, "_SIG29.csv")))
+lm_int_scored %>% filter(interaction_class != "none") %>% arrange(p_adj_interaction) %>% head(10)
+```
+
+## Number of interaction programs per ligand pair
+
+```{r, fig.width=8, fig.height=5}
+lm_int_scored %>%
+  mutate(sig = interaction_class != "none") %>%
+  group_by(interaction) %>%
+  summarise(n_sig = sum(sig), .groups = "drop") %>%
+  ggplot(aes(x = reorder(interaction, n_sig), y = n_sig)) +
+  geom_col() +
+  coord_flip() +
+  labs(x = "ligand pair", y = paste0("n interaction programs (padj < ", sig_alpha, ")"))
+```
+
+# Condition effects (lm contrasts)
+
+Each SIG29 condition's effect vs. the `none_none` control is a linear
+combination of the model coefficients fit above: for a single-ligand condition
+it is the `lig_<L>` coefficient; for a combo it is
+`lig_<A> + lig_<B> + pair_<A>_<B>`. Estimates and robust (HC3) standard errors
+are taken from the same fits, so the combo columns get a proper test rather than
+being read off a single coefficient. p-values are BH-adjusted across all
+program x condition contrasts at once.
+
+```{r}
+# ligand membership per condition (none_none = control, excluded)
+cond_ligands <- obs %>%
+  distinct(ligand1, ligand2) %>%
+  mutate(cond = paste0(ligand1, "_", ligand2)) %>%
+  filter(cond != "none_none") %>%
+  mutate(ligands = map2(ligand1, ligand2, ~ setdiff(c(.x, .y), "none")))
+
+# contrast vector (in coefficient space) for one condition
+contrast_terms <- function(ligs) {
+  c(paste0("lig_", ligs),
+    if (length(ligs) == 2) paste0("pair_", paste(sort(ligs), collapse = "_")))
+}
+
+# est = c'b, se = sqrt(c'Vc) with V = HC3; two-sided t-test on the model's df
+condition_contrast <- function(mod, terms) {
+  b <- coef(mod)
+  V <- .robust_vcov(mod)
+  cvec <- setNames(as.numeric(names(b) %in% terms), names(b))
+  est <- sum(cvec * b)
+  se  <- sqrt(drop(t(cvec) %*% V %*% cvec))
+  tibble(estimate = est, std.error = se,
+         p.value = 2 * pt(abs(est / se), df = df.residual(mod), lower.tail = FALSE))
+}
+
+cond_assoc <- lm_models %>%
+  dplyr::select(feature, model) %>%
+  tidyr::crossing(cond_ligands %>% dplyr::select(cond, ligands)) %>%
+  mutate(res = map2(model, ligands, ~ condition_contrast(.x, contrast_terms(.y)))) %>%
+  dplyr::select(feature, cond, res) %>%
+  unnest(res) %>%
+  left_join(feature_map, by = "feature") %>%
+  mutate(p_adj = p.adjust(p.value, method = "BH"))
+
+write_csv(cond_assoc, file.path(out_dir, paste0("scoreConditionLM_", score_method, "_SIG29.csv")))
+cond_assoc %>% arrange(p_adj) %>% head(10)
+```
+
+# Effect-size heatmap: TGFb/TNF class programs
+
+Two panels sharing rows, both showing **linear-model estimates** on z-scaled
+scores (SDs of that program's score within its experiment), so they are on
+comparable scales:
+
+- **left** — SIG29 condition effects vs. `none_none` from the contrasts above,
+  starred by their globally BH-adjusted p-values.
+- **right** — the same programs in the original SIG18 ligand experiment, from
+  SIG18's `ligand1 * ligand2` model: the `TGFb` and `TNF` main effects and their
+  combined effect (`TGFb` + `TNF` + interaction, SIG18's
+  `estimate_total_interaction_model`). Left unstarred because no single
+  coefficient tests that summed combined effect.
+
+```{r}
+lmScored <- read_csv(sig18_lm_scored_clean) %>%
+  filter(interaction == "TGFb_TNF")
+```
+
+```{r}
+n_components <- 6
+# top `n` components where `p_col`/`est_col` (one ligand's main effect) clears
+# est_threshold/p_threshold and the other ligand's main effect (other_*) doesn't
+# -- i.e. a ligand-specific (not shared) effect
+ligand_only_components <- function(df, p_col, est_col, other_p_col, other_est_col,
+                                    p_threshold = 0.1, est_threshold = 0.5, n = n_components) {
+  df %>%
+    filter(!grepl("synergy positive", interaction_class)) %>%
+    filter(.data[[p_col]] < p_threshold & .data[[est_col]] > est_threshold) %>%
+    filter(!(.data[[other_p_col]] < p_threshold & .data[[other_est_col]] > 0)) %>%
+    slice_min(.data[[p_col]], n = n) %>%
+    pull(component)
+}
+
+tgfb_tnf_synergy <- lmScored %>%
+  filter(interaction_class == "synergy positive") %>%
+  slice_min(p_adj_interaction, n = n_components) %>%
+  pull(component)
+
+tgfb_only <- ligand_only_components(lmScored, "p_adj_ligand1", "estimate_ligand1", "p_adj_ligand2", "estimate_ligand2")
+tnf_only  <- ligand_only_components(lmScored, "p_adj_ligand2", "estimate_ligand2", "p_adj_ligand1", "estimate_ligand1")
+
+comp_class <- bind_rows(
+  tibble(component = tgfb_tnf_synergy, class = "synergy positive"),
+  tibble(component = tgfb_only,        class = "tgfb"),
+  tibble(component = tnf_only,         class = "tnf")
+) %>%
+  distinct(component, .keep_all = TRUE)
+```
+
+## Building the matrices
+
+```{r}
+# programs x levels matrix from a long data frame, in the requested row/col order
+as_program_matrix <- function(df, col, value, row_order, col_order = NULL) {
+  mat <- df %>%
+    filter(program %in% row_order) %>%
+    dplyr::select(program, all_of(c(col, value))) %>%
+    pivot_wider(names_from = all_of(col), values_from = all_of(value)) %>%
+    column_to_rownames("program") %>%
+    as.matrix()
+  if (is.null(col_order)) col_order <- colnames(mat)
+  mat[row_order, col_order, drop = FALSE]
+}
+
+# Adjusted p-values -> significance stars, on the conventional 0.05/0.01/0.001
+# ladder (deliberately NOT `sig_alpha`, the looser 0.1 cutoff used for labelling
+# programs elsewhere in this notebook).
+stars_from_padj <- function(p) {
+  stars_vec <- case_when(
+    is.na(as.vector(p))  ~ "",
+    as.vector(p) < 0.001 ~ "***",
+    as.vector(p) < 0.01  ~ "**",
+    as.vector(p) < 0.05  ~ "*",
+    TRUE                 ~ "")
+  matrix(stars_vec, nrow = nrow(p), dimnames = dimnames(p))
+}
+
+# row annotation + row order, shared by both panels
+ann_row <- comp_class %>%
+  arrange(class, component) %>%
+  column_to_rownames("component")
+row_order <- rownames(ann_row)
+gaps_row  <- head(cumsum(table(ann_row$class)), -1)
+
+n_classes <- n_distinct(ann_row$class)
+class_colors <- setNames(brewer.pal(max(3, n_classes), "Set2")[seq_len(n_classes)],
+                          sort(unique(ann_row$class)))
+
+# column order for each panel (single ligands, then the TGFb combos)
+SIG29_order <- c("TGFb_none", "none_TNF", "none_TL1A", "none_DTA1", "none_OX40L",
+                 "TGFb_TNF", "TGFb_TL1A", "TGFb_DTA1", "TGFb_OX40L")
+SIG18_order <- c("TNF", "TGFb", "TGFb+TNF")
+
+# SIG29 conditions: lm contrast vs none_none, and its matching p-value
+mat_cond   <- as_program_matrix(cond_assoc, "cond", "estimate", row_order, SIG29_order)
+stars_cond <- as_program_matrix(cond_assoc, "cond", "p_adj", row_order, SIG29_order) %>%
+  stars_from_padj()
+
+# SIG18 ligands: main effects of each ligand, plus their combined effect
+# (estimate_ligand1 + estimate_ligand2 + estimate_interaction, precomputed by SIG18)
+mat_sig18 <- lmScored %>%
+  dplyr::select(program = component,
+                TNF        = estimate_ligand2,
+                TGFb       = estimate_ligand1,
+                `TGFb+TNF` = estimate_total_interaction_model) %>%
+  pivot_longer(-program, names_to = "condition", values_to = "estimate") %>%
+  as_program_matrix("condition", "estimate", row_order, SIG18_order)
+```
+
+## Drawing
+
+```{r, fig.height=4, fig.width=8}
+hm_colors <- colorRampPalette(rev(brewer.pal(11, "RdBu")))(100)
+
+# `mat`/`stars` already carry the intended row and column order (see above), so
+# no reordering happens here. `stars = NULL` draws the panel without annotations.
+plot_class_heatmap <- function(mat, title, stars = NULL) {
+  max_abs   <- max(abs(mat), na.rm = TRUE)
+  hm_breaks <- seq(-max_abs, max_abs, length.out = 101)
+  pheatmap(mat,
+           color = hm_colors, breaks = hm_breaks,
+           annotation_row = ann_row,
+           annotation_colors = list(class = class_colors),
+           cluster_rows = FALSE, cluster_cols = FALSE,
+           gaps_row = gaps_row,
+           main = title,
+           display_numbers = if (is.null(stars)) FALSE else stars,
+           fontsize_number = 10, number_color = "black",
+           fontsize_row = 8, fontsize_col = 8, silent = TRUE,
+           angle_col = 90)
+}
+
+combined_hm <- arrangeGrob(
+  plot_class_heatmap(mat_cond, "SIG29 cytokine treatment\nlm estimate vs control", stars_cond)$gtable,
+  plot_class_heatmap(mat_sig18, "SIG18 ligand treatment\nlm estimate vs Th0")$gtable,
+  ncol = 2, widths = c(1.4, 1)
+)
+
+grid.newpage()
+grid.draw(combined_hm)
+
+pdf(file.path(out_dir, paste0("scoreHeatmap_classEstimate_SIG18vsSIG29_", score_method, ".pdf")),
+    width = 8, height = 4)
+grid.draw(combined_hm)
+dev.off()
+```
+
+```{r, fig.height=4, fig.width=8}
+combined_hm <- arrangeGrob(
+  plot_class_heatmap(mat_cond, "SIG29 cytokine treatment\nlm estimate vs control")$gtable,
+  plot_class_heatmap(mat_sig18, "SIG18 ligand treatment\nlm estimate vs Th0")$gtable,
+  ncol = 2, widths = c(1.4, 1)
+)
+
+grid.newpage()
+grid.draw(combined_hm)
+
+pdf(file.path(out_dir, paste0("scoreHeatmap_noStars_classEstimate_SIG18vsSIG29_", score_method, ".pdf")),
+    width = 8, height = 4)
+grid.draw(combined_hm)
+dev.off()
+```
+
+The SIG29 panel on its own, transposed to conditions x programs for a wide
+figure. The program class annotation and its gaps move from rows to columns with
+the transpose, so `ann_row`/`gaps_row` are passed as `annotation_col`/`gaps_col`.
+
+```{r, fig.height=2.5, fig.width=6}
+max_abs   <- max(abs(mat_cond), na.rm = TRUE)
+hm_breaks <- seq(-max_abs, max_abs, length.out = 101)
+hm <- pheatmap(
+  t(mat_cond),
+  color = hm_colors, breaks = hm_breaks,
+  annotation_col = ann_row,
+  annotation_colors = list(class = class_colors),
+  cluster_rows = FALSE, cluster_cols = FALSE,
+  gaps_col = gaps_row,
+  display_numbers = t(stars_cond),
+  fontsize_number = 10, number_color = "black",
+  fontsize_row = 8, fontsize_col = 8, angle_col = 90
+)
+save_pheatmap_pdf(hm, file.path(out_dir, paste0("scoreHeatmap_classEstimate_SIG29_", score_method, ".pdf")),
+                  width = 6, height = 2.5)
+```
+
+# Volcano plots (interaction effect per program)
+
+Interaction estimate (the `pair_<A>_<B>` term) vs. significance, faceted by
+ligand pair. Points are colored by the `ligand1TGFb:ligand2TNF` interaction
+estimate and sized by its `-log10(p_adj)`, both pulled from SIG18's own sPCA
+annotation (`lm_fit_zscore_degs_alpha10.0_sPCA.csv`), joined per program (see
+`SIG27/analysis/projection/spca_score_analysis_SIG27.Rmd` for the reference
+plot style); programs with a non-`none` interaction class are labelled.
+
+```{r}
+lmFit <- read_csv(sig18_lm_fit)
+```
+
+
+```{r}
+volcano_interaction <- function(interaction_overlay) {
+  # filter SIG18 lm results for desired overlay term
+  lmInput <- lmFit %>%
+    filter(term == interaction_overlay) %>%
+    dplyr::select(program = component, estimate_overlay = estimate, p_adj_overlay = p_adj)
+
+  lm_int_scored %>%
+    left_join(lmInput, by = "program") %>%
+    ggplot(aes(x = estimate_interaction, y = -log10(p_adj_interaction))) +
+    geom_hline(yintercept = -log10(sig_alpha), lty = 2, color = "grey60") +
+    geom_vline(xintercept = 0, lty = 2, color = "grey60") +
+    geom_point(aes(fill = estimate_overlay, size = -log10(p_adj_overlay)), shape = 21) +
+    geom_text_repel(aes(label = ifelse(interaction_class != "none", program, "")),
+                    size = 2, max.overlaps = 15) +
+    scale_fill_distiller(palette = "RdBu") +
+    facet_wrap(~ interaction) +
+    theme(aspect.ratio = 1) +
+    labs(title = paste0("SIG18 programs — SIG29 (", score_method, ")"),
+         x = "interaction estimate (pair term)",
+         fill = paste0("estimate\n",interaction_overlay),
+         size = paste0("pscore\n",interaction_overlay))
+}
+```
+
+```{r}
+overlays <- c("ligand1TGFb:ligand2TNF", "ligand1TGFb", "ligand2TNF")
+volcano_plots <- setNames(purrr::map(overlays, volcano_interaction), overlays)
+```
+
+```{r, fig.width=10, fig.height=8}
+volcano_plots[["ligand1TGFb:ligand2TNF"]]
+volcano_plots[["ligand1TGFb"]]
+volcano_plots[["ligand2TNF"]]
+```
+
+```{r}
+for (ov in overlays) {
+  ov_tag <- gsub("[^A-Za-z0-9]+", "_", ov)
+  ggsave(file.path(out_dir, paste0("scoreVolcano_SIG18_", ov_tag, "_", score_method, "_SIG29.pdf")),
+         volcano_plots[[ov]], width = 10, height = 8)
+}
+```

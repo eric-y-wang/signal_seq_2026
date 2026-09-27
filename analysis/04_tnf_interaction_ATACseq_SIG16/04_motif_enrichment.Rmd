@@ -1,0 +1,320 @@
+---
+title: "SIG16 ATAC: TF motif enrichment in differentially accessible regions"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(patchwork)
+})
+knitr::opts_chunk$set(echo = TRUE)
+
+# Repo-relative paths (inputs: imports_stable/, outputs: analysis_outs/)
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "04_tnf_interaction_ATACseq_SIG16")
+source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
+theme_set(theme_Publication())
+
+set.seed(1)
+
+idr <- 0.05
+job.name <- paste0("idr-", idr)
+
+DESEQ_DIR <- file.path(imports_dir, "SIG16/analysis_outs/deseq2-merged-reps", job.name)
+OUT_DIR   <- file.path(outs_dir,
+                       "motif_enrichment-hypergeometric-merged-reps", job.name)
+PLOT_DIR  <- file.path(outs_dir, "plots",
+                       "motif_enrichment-hypergeometric-merged-reps")
+
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(PLOT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+padj.threshold <- 0.05
+lfc.threshold  <- log2(1.5)
+```
+
+# Goal
+
+Ask which TF motifs are over-represented in each set of differentially accessible regions,
+reproducing `ATAC-analysis/SIG16_ATAC/3-motif-enrichment.R`.
+
+The test is a one-sided hypergeometric test per motif: given the number of atlas peaks
+containing a FIMO hit for that motif, how surprising is the number of hits inside the region
+set of interest? Fold enrichment is the hit rate in the region set over the hit rate across
+the whole atlas, and p-values are BH-adjusted across motifs within each region set.
+
+Seventeen region sets are tested:
+
+- **8 single-ligand sets** — gained / lost peaks for each of TGFb, IL4, IL6, TNF.
+- **9 interaction sets** — the three SIG13 interaction classes (`synergy positive`,
+  `synergy negative`, `buffering`) for each of the three `ligand1 x TNF` pairs, taken from
+  `03_interaction_classification.Rmd`.
+
+Splitting the interaction peaks by class rather than by the sign of the interaction coefficient
+is the point of this notebook: `synergy positive` and `synergy negative` peaks both have a
+same-signed interaction term but move in opposite directions overall, so the motifs driving them
+should differ. `buffering` peaks are the ones where the second ligand blunts the first.
+
+> Note: the collaborator's script tested TGFb, IL4 and TNF singles plus the TGFb x TNF and
+> IL4 x TNF interactions, split only on the sign of the interaction coefficient. IL6 is included
+> here as well, since the corresponding DESeq2 and interaction-classification results exist.
+
+# Import
+
+`motif_mtx.rds` is a peaks x motifs binary matrix of FIMO hits over the same atlas;
+`motif_info.rds` maps each motif to its TF and structural family.
+
+```{r}
+motif.mtx.peak.final <- readRDS(file.path(imports_dir, "SIG16/analysis_outs/fimo", job.name, "motif_mtx.rds"))
+colnames(motif.mtx.peak.final) <- stringr::str_split_i(colnames(motif.mtx.peak.final), "_[A-Z]", 1)
+
+motif.info <- readRDS(file.path(imports_dir, "SIG16/analysis_outs/motif_info.rds"))
+pal <- readRDS(file.path(imports_dir, "SIG16/analysis_outs/plots/pal_family.rds"))
+
+dim(motif.mtx.peak.final)
+```
+
+```{r}
+read_single <- function(term) {
+  readRDS(file.path(DESEQ_DIR, paste0("name-", term), "unshrunken-res.table.rds"))
+}
+# interaction-classification.csv carries the SIG13 schema: `name` + `interaction_class`
+read_itxn <- function(l1, l2 = "TNF") {
+  df <- read.csv(file.path(DESEQ_DIR, paste0("name-ligand1", l1, ".ligand2", l2),
+                           "interaction-classification.csv"))
+  rownames(df) <- df$name
+  df
+}
+
+singles <- list(TGFb = read_single("ligand1_TGFb_vs_none"),
+                IL4  = read_single("ligand1_IL4_vs_none"),
+                IL6  = read_single("ligand1_IL6_vs_none"),
+                TNF  = read_single("ligand2_TNF_vs_none"))
+
+itxns <- list(TGFb.TNF = read_itxn("TGFb"),
+              IL4.TNF  = read_itxn("IL4"),
+              IL6.TNF  = read_itxn("IL6"))
+```
+
+# Define region sets
+
+```{r}
+split_by_lfc <- function(df, lfc.col, padj.col) {
+  keep <- !is.na(df[[padj.col]]) & df[[padj.col]] < padj.threshold
+  list(pos = df[keep & df[[lfc.col]] >  lfc.threshold, ],
+       neg = df[keep & df[[lfc.col]] < -lfc.threshold, ])
+}
+
+itxn.classes <- c("synergy positive", "synergy negative", "buffering")
+set_name <- function(prefix, cl) paste0(prefix, ".", gsub(" ", "_", cl))
+
+regions <- list()
+for (nm in names(singles)) {
+  s <- split_by_lfc(singles[[nm]], "log2FoldChange", "padj")
+  regions[[paste0(nm, ".gained")]] <- s$pos
+  regions[[paste0(nm, ".lost")]]   <- s$neg
+}
+for (nm in names(itxns)) {
+  for (cl in itxn.classes) {
+    peaks <- itxns[[nm]][!is.na(itxns[[nm]]$interaction_class) &
+                           itxns[[nm]]$interaction_class == cl, ]
+    rownames(peaks) <- peaks$name   # the enrichment test matches peaks on rownames
+    regions[[set_name(nm, cl)]] <- peaks
+  }
+}
+
+tibble(region = names(regions), n_peaks = map_int(regions, nrow))
+```
+
+# Hypergeometric enrichment
+
+Several interaction classes are legitimately tiny (the TGFb x TNF and IL6 x TNF interaction
+terms yield only a handful of significant peaks), so empty sets are skipped rather than fed to
+`phyper` with a zero denominator.
+
+```{r}
+# One-sided hypergeometric test per motif: of the `all_peaks` in the atlas,
+# `matches_in_all_peaks` carry the motif; ask whether the `DARs` in this region set
+# carry it more often than that background rate.
+hypergeom.res.list <- compact(imap(regions, function(input.regions, region.name) {
+  if (nrow(input.regions) == 0) return(NULL)
+
+  peak.pos <- match(rownames(input.regions), rownames(motif.mtx.peak.final))
+  n.all <- nrow(motif.mtx.peak.final)
+  n.dar <- length(peak.pos)
+
+  res <- imap_dfr(motif.mtx.peak.final, function(hits, motif) {
+    hits.all  <- sum(hits)
+    hits.dar  <- sum(hits[peak.pos])
+    tibble(motif = motif,
+           pval = phyper(hits.dar - 1, hits.all, n.all - hits.all, n.dar,
+                         lower.tail = FALSE),
+           fold_enrichment = (hits.dar / n.dar) / (hits.all / n.all),
+           matches_in_DARs = hits.dar, DARs = n.dar,
+           matches_in_all_peaks = hits.all, all_peaks = n.all)
+  }) %>%
+    arrange(pval) %>%
+    mutate(p.adjust = p.adjust(pval, method = "BH"), .after = pval) %>%
+    relocate(motif, .after = all_peaks) %>%
+    as.data.frame()
+  rownames(res) <- res$motif
+
+  res$family <- motif.info[match(rownames(res), motif.info$TF), "family"]
+  write.csv(res, file.path(OUT_DIR, paste0(region.name, ".csv")), quote = FALSE)
+  res
+}))
+```
+
+```{r}
+padj.cutoff <- 0.05
+fe.cutoff   <- 1.5
+k <- 10
+
+map_dfr(hypergeom.res.list, ~ tibble(
+  n_motifs_tested = nrow(.x),
+  n_significant = sum(.x$p.adjust < padj.cutoff & .x$fold_enrichment > fe.cutoff, na.rm = TRUE)
+), .id = "region") %>%
+  left_join(tibble(region = names(regions), n_peaks = map_int(regions, nrow)), by = "region") %>%
+  relocate(n_peaks, .after = region)
+```
+
+# Top-motif bar plots
+
+Top `r k` motifs by fold enrichment, among motifs passing `p.adjust < 0.05` and
+fold enrichment > 1.5, coloured by TF structural family.
+
+```{r}
+top_motifs <- function(res, k = 10) {
+  sig.tf <- res[(res$p.adjust < padj.cutoff) & (res$fold_enrichment > fe.cutoff), ]
+  sig.tf <- sig.tf %>% arrange(desc(fold_enrichment))
+  sig.tf <- sig.tf[seq_len(min(k, nrow(sig.tf))), ]
+  sig.tf[!is.na(sig.tf$pval), ]
+}
+
+plot_bar <- function(sig.tf, region.name) {
+  ggplot(sig.tf) +
+    geom_col(aes(x = fold_enrichment, y = reorder(motif, fold_enrichment), fill = family)) +
+    theme(axis.text.y = element_text(size = 12), axis.title.y = element_blank()) +
+    labs(title = region.name, x = "fold enrichment") +
+    scale_fill_manual(values = pal$family) +
+    theme(aspect.ratio = 2)
+}
+```
+
+```{r, results='asis', fig.width=7, fig.height=4, message=FALSE, warning=FALSE}
+bar.plots <- list()
+for (region.name in names(hypergeom.res.list)) {
+  sig.tf <- top_motifs(hypergeom.res.list[[region.name]], k)
+  cat("\n## ", region.name, " (", nrow(sig.tf), " motifs shown)\n", sep = "")
+  if (nrow(sig.tf) == 0) { cat("No motifs pass the enrichment cutoffs.\n"); next }
+  bar.plots[[region.name]] <- plot_bar(sig.tf, region.name)
+}
+```
+
+All panels are assembled into a single multi-panel PDF with `patchwork` rather than one file per
+region set; the fill legend is collected once for the whole figure.
+
+```{r, fig.height=10, fig.width=20}
+n.col <- 4
+n.row <- ceiling(length(bar.plots) / n.col)
+wrap_plots(bar.plots, ncol = n.col) +
+  plot_layout() &
+  theme(legend.position = "right")
+
+ggsave(file.path(PLOT_DIR, paste0("barplots-top", k, "-motifs-padj-", padj.cutoff, ".pdf")))
+```
+
+# Bi-directional bar plots
+
+Two opposing region sets on one axis; bar length is fold enrichment in either direction. For the
+single ligands the pair is gained (right) vs lost (left); for the interactions it is
+`synergy positive` (right) vs `synergy negative` (left). The `buffering` sets have no natural
+opposite and appear only in the uni-directional plots above.
+
+```{r}
+bidirectional_pairs <- tibble::tribble(
+  ~label,     ~pos,                        ~neg,                        ~pos.lab,           ~neg.lab,
+  "TGFb",     "TGFb.gained",               "TGFb.lost",                 "gained",           "lost",
+  "IL4",      "IL4.gained",                "IL4.lost",                  "gained",           "lost",
+  "IL6",      "IL6.gained",                "IL6.lost",                  "gained",           "lost",
+  "TNF",      "TNF.gained",                "TNF.lost",                  "gained",           "lost",
+  "TGFb.TNF", "TGFb.TNF.synergy_positive", "TGFb.TNF.synergy_negative", "synergy positive", "synergy negative",
+  "IL4.TNF",  "IL4.TNF.synergy_positive",  "IL4.TNF.synergy_negative",  "synergy positive", "synergy negative",
+  "IL6.TNF",  "IL6.TNF.synergy_positive",  "IL6.TNF.synergy_negative",  "synergy positive", "synergy negative")
+
+plot_bidirectional <- function(pair) {
+  sig.tf.pos <- top_motifs(hypergeom.res.list[[pair$pos]], k)
+  sig.tf.neg <- top_motifs(hypergeom.res.list[[pair$neg]], k)
+  if (!is.null(sig.tf.neg)) sig.tf.neg$fold_enrichment <- sig.tf.neg$fold_enrichment * -1
+
+  sig.tf <- rbind(sig.tf.pos, sig.tf.neg)
+  if (is.null(sig.tf) || nrow(sig.tf) == 0) return(NULL)
+
+  sig.tf <- sig.tf %>% arrange(fold_enrichment)
+  sig.tf$rank <- factor(seq_len(nrow(sig.tf)), levels = seq_len(nrow(sig.tf)))
+
+  annotations <- data.frame(
+    xpos = c(-Inf, Inf),
+    ypos = c(-Inf, -Inf),
+    annotateText = c(pair$neg.lab, pair$pos.lab),
+    hjustvar = c(0, 1.1),
+    vjustvar = c(-0.5, -0.5))
+
+  bar.p <- ggplot(sig.tf) +
+    geom_col(aes(x = fold_enrichment, y = rank, fill = family)) +
+    theme(axis.text.y = element_text(size = 12), axis.title.y = element_blank()) +
+    #scale_x_continuous(breaks = seq(-10, 10, 1), labels = abs(seq(-10, 10, 1))) +
+    # extra room at the bottom so the direction labels clear the last bar
+    scale_y_discrete(labels = sig.tf$motif, expand = expansion(add = c(1.2, 0.6))) +
+    scale_fill_manual(values = pal$family) +
+    labs(title = pair$label, x = "fold enrichment") +
+    geom_text(data = annotations,
+              aes(x = xpos, y = ypos, hjust = hjustvar, vjust = vjustvar,
+                  label = annotateText)) +
+    theme(aspect.ratio = 2)
+  bar.p
+}
+```
+
+```{r, results='asis', fig.width=7, fig.height=6, message=FALSE, warning=FALSE}
+bidir.plots <- list()
+for (i in seq_len(nrow(bidirectional_pairs))) {
+  pair <- as.list(bidirectional_pairs[i, ])
+  cat("\n\n## ", pair$label, "\n\n", sep = "")
+  if (!all(c(pair$pos, pair$neg) %in% names(hypergeom.res.list))) {
+    cat("One or both region sets are empty; no plot.\n\n"); next
+  }
+  p <- plot_bidirectional(pair)
+  if (is.null(p)) {
+    cat("No motifs pass the enrichment cutoffs.\n\n")
+  } else {
+    bidir.plots[[pair$label]] <- p
+    print(p)
+  }
+}
+```
+
+```{r}
+n.col <- 4
+n.row <- ceiling(length(bidir.plots) / n.col)
+bidir.panel <- wrap_plots(bidir.plots, ncol = n.col) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "right")
+
+ggsave(file.path(PLOT_DIR,
+                 paste0("barplots-bidirectional-top", k, "-motifs-padj-", padj.cutoff, ".pdf")),
+       bidir.panel, width = 5 * n.col, height = 6 * n.row, limitsize = FALSE)
+```

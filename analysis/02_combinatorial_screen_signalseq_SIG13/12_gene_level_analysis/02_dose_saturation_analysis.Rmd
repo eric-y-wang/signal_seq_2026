@@ -1,0 +1,180 @@
+---
+title: "Dose saturation analysis"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup}
+library(tidyverse)
+library(patchwork)
+library(viridisLite)
+library(ggrepel)
+library(ComplexHeatmap)
+library(circlize)
+library(RColorBrewer)
+library(ggpointdensity)
+library(scales)
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(patchwork)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Repo-relative paths: inputs from imports_stable/, outputs to analysis_outs/
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "02_combinatorial_screen_signalseq_SIG13")
+dir.create(file.path(outs_dir, "plots/qc"), showWarnings = FALSE, recursive = TRUE)
+source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
+theme_set(theme_Publication())
+
+interaction_palette <- c("#808080",brewer.pal(5,"Dark2"))
+```
+
+# Goal
+
+To use the double dose conditions to demonstrate how saturating signals are in this assay
+
+# Import
+
+```{r}
+interScored <- read_csv(file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/interactions_scored_v3_glmGamPoi_0.05filter.csv")) %>%
+  mutate(interaction_class = case_when(interaction_class == "additive over saturation" ~ "none",
+                                       interaction_class == "buffering complete" ~ "buffering",
+                                       TRUE ~ interaction_class)) %>%
+  mutate(interaction_class = factor(interaction_class,
+                                                levels = c("none","buffering","synergy negative","synergy positive")))
+
+```
+
+# FC-FC analysis
+
+```{r, fig.height=8, fig.width=15}
+ligands <- c("IL2","IL4","IL6","IL7","IL12","IL21","IL23","IL27","IFNG","TNF")
+
+plot_list <- map(ligands, function(ligand) {
+  df <- interScored %>%
+    mutate(interaction = case_when(
+      interaction == paste0(ligand, "_", ligand) ~ "double_dose",
+      interaction == paste0(ligand, "_linker")  ~ "single_dose"
+    )) %>%
+    filter(interaction %in% c("double_dose", "single_dose")) %>%
+    pivot_wider(
+      id_cols     = name,
+      names_from  = interaction,
+      values_from = c(lfc_condition, adj_pval_condition, interaction_class)
+    ) %>%
+    mutate(significance = case_when(
+      adj_pval_condition_double_dose < 0.05 & adj_pval_condition_single_dose >= 0.05 ~ "significant double",
+      adj_pval_condition_single_dose < 0.05 & adj_pval_condition_double_dose >= 0.05 ~ "significant single",
+      adj_pval_condition_double_dose < 0.05 & adj_pval_condition_single_dose < 0.05  ~ "significant both",
+      TRUE                                                                            ~ "not_significant"
+    ))
+
+  ggplot(df %>% filter(significance != "not_significant"),
+         aes(x = lfc_condition_single_dose,
+             y = lfc_condition_double_dose,
+             color = significance)) +
+    geom_point() +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+    scale_color_brewer(palette = "Dark2") +
+    ylim(-5, 5) +
+    xlim(-5, 5) +
+    xlab("LFC single") +
+    ylab("LFC double") +
+    ggtitle(ligand) +
+    theme(aspect.ratio = 1,
+          legend.position = "none")
+})
+
+names(plot_list) <- ligands
+
+wrap_plots(plot_list, ncol = 5)
+```
+
+```{r, fig.height=8, fig.width=15}
+ligands <- c("IL2","IL4","IL6","IL7","IL21","IL27","IFNG","TNF")
+
+plot_list <- map(ligands, function(ligand) {
+  df <- interScored %>%
+    mutate(interaction = case_when(
+      interaction == paste0(ligand, "_", ligand) ~ "double_dose",
+      interaction == paste0(ligand, "_linker")  ~ "single_dose"
+    )) %>%
+    filter(interaction %in% c("double_dose", "single_dose")) %>%
+    pivot_wider(
+      id_cols     = name,
+      names_from  = interaction,
+      values_from = c(lfc_condition, adj_pval_condition, interaction_class)
+    ) %>%
+    mutate(significance = case_when(
+      adj_pval_condition_double_dose < 0.05 & adj_pval_condition_single_dose >= 0.05 ~ "significant double",
+      adj_pval_condition_single_dose < 0.05 & adj_pval_condition_double_dose >= 0.05 ~ "significant single",
+      adj_pval_condition_double_dose < 0.05 & adj_pval_condition_single_dose < 0.05  ~ "significant both",
+      TRUE                                                                            ~ "not_significant"
+    ))
+
+  ggplot(df %>% filter(significance != "not_significant"),
+         aes(x = lfc_condition_single_dose,
+             y = lfc_condition_double_dose,
+             color = interaction_class_double_dose)) +
+    geom_point() +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+    scale_color_manual(values = interaction_palette, breaks = c("none","additive over saturation","buffering","buffering complete","synergy negative","synergy positive")) +
+    ylim(-5, 5) +
+    xlim(-5, 5) +
+    xlab("LFC single") +
+    ylab("LFC double") +
+    ggtitle(ligand) +
+    theme(aspect.ratio = 1,
+          legend.position = "none")
+})
+
+names(plot_list) <- ligands
+
+wrap_plots(plot_list, ncol = 4)
+ggsave(file.path(outs_dir, "plots/qc/dose_saturation_plots.pdf"))
+```
+
+It's clear that the genes with the highest LFC have transcriptional effects that are highly buffered, likely due to receptor saturation. There are some genes, such as for IL27 or IL21, where genes with weaker LFCs are still sensitive to increased concentrations of ligand, but that also may just be noise.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

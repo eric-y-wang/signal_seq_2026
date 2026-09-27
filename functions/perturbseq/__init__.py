@@ -16,5 +16,4 @@ from __future__ import absolute_import
 __version__ = 0.1
 
 from .expression_normalization import normalize_matrix_to_control, normalize_to_control_adata
-from .mixscape_modified import perturbation_signature_zscore, mixscape_gene_list
 from .zscore_multithread import normalize_to_control_adata_multithread

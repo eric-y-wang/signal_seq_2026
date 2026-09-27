@@ -1,0 +1,201 @@
+---
+title: "SIG13 GLM Validation "
+author: "Ian Zumpano"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+# SIG07 vs SIG13 GLM Validation
+
+Goal: to get pearson correlation of GLM LFC terms between SIG07 and SIG13
+
+## Load packages:
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(dplyr)
+# Repo-relative paths: inputs are read from imports_stable/, outputs are written to analysis_outs/
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find the repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "02_combinatorial_screen_signalseq_SIG13")
+source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
+dir.create(file.path(outs_dir, "plots/qc"), recursive = TRUE, showWarnings = FALSE)
+theme_set(theme_Publication())
+```
+
+
+## Interaction LFC Correlation
+
+```{r}
+sig13_data <- read.csv(file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/interactions_scored_v3_glmGamPoi_0.05filter_sig.csv"))
+sig07_data <- read.csv(file.path(imports_dir, "SIG07/analysis_outs/glmGamPoi/glmGamPoi_interaction/glmGamPoi_interaction_lfc_0.05filter.csv"))
+```
+
+
+## Counts of significant interactions per group
+
+```{r}
+sig07_data_interact <- sig07_data %>% filter(!is.na(lfc))
+sig13_data_interact <- sig13_data %>% filter(!is.na(lfc_interaction))
+```
+
+```{r}
+sig13_data_interact <- sig13_data_interact %>% mutate(
+    parts = str_split(interaction, "_"),
+    # alphabetically sort each pair
+    interaction_sorted = sapply(parts, function(x) paste(sort(x), collapse = "_"))
+  )
+
+sig07_data_interact <- sig07_data_interact %>% mutate(
+    parts = str_split(interaction, "_"),
+    # alphabetically sort each pair
+    interaction_sorted = sapply(parts, function(x) paste(sort(x), collapse = "_"))
+  )
+
+sig07_data_interact <- sig07_data_interact %>% mutate(lfc_interaction = lfc)
+```
+
+```{r}
+nsig07 <- sig07_data_interact %>% group_by(interaction_sorted) %>% summarize(nsig = sum(adj_pval < 0.05, na.rm = TRUE)) %>% arrange(nsig) %>% as_data_frame()
+
+nsig13 <- sig13_data_interact %>% group_by(interaction_sorted) %>% summarize(nsig = sum(adj_pval_interaction < 0.05, na.rm = TRUE)) 
+
+nsig_interactions <- inner_join(nsig13, nsig07, by = 'interaction_sorted', suffix = c(".sig13", ".sig07"))
+nsig_interactions
+```
+Based on this, threshold of 100 significant interactions per group in both SIG07 and SIG13 seems reasonable
+
+```{r}
+interactions_to_keep = nsig_interactions %>% filter(nsig.sig13 >= 100 & nsig.sig07 >= 100) %>% pull(interaction_sorted)
+```
+
+### Take mean of duplicate interaction terms
+
+```{r}
+sig13_to_corr <- sig13_data_interact %>%
+  group_by(interaction_sorted, name) %>%
+  summarise(mean_interaction_lfc = mean(lfc_interaction, na.rm = TRUE))
+
+sig07_to_corr <- sig07_data_interact %>%
+  group_by(interaction_sorted, name) %>%
+  summarise(mean_interaction_lfc = mean(lfc_interaction, na.rm = TRUE))
+
+sig13_to_corr <- as_data_frame(sig13_to_corr)
+sig07_to_corr <- as_data_frame(sig07_to_corr)
+```
+
+```{r}
+joint_data_interact <- inner_join(sig13_to_corr, sig07_to_corr, by = c("interaction_sorted", "name"), suffix = c(".sig13", ".sig07")) 
+```
+
+
+```{r}
+joint_data_interact_filtered <- joint_data_interact %>% filter(interaction_sorted %in% interactions_to_keep)
+```
+
+
+### Get correlation
+
+```{r}
+correlation_results <- joint_data_interact_filtered %>%
+  group_by(interaction_sorted) %>%
+  summarise(
+    pearson_corr = cor(mean_interaction_lfc.sig13, mean_interaction_lfc.sig07, method = "pearson")
+  )
+
+correlation_results %>% arrange(desc(pearson_corr))
+```
+
+### scatterplots
+
+```{r}
+library(ggplot2)
+
+p <- ggplot(joint_data_interact_filtered, aes(x = mean_interaction_lfc.sig13, y = mean_interaction_lfc.sig07)) +
+  geom_point(alpha = 0.6) + 
+  geom_smooth(method = "lm", color = "red", se = FALSE) + 
+  
+  # Set ncol = 3 to force 3 columns
+  facet_wrap(~interaction_sorted, scales = "free", ncol = 3) +
+  
+  theme_bw()
+
+# WHEN SAVING:
+# 1. 'limitsize = FALSE' lets you save very tall images.
+# 2. Increase 'width' to stretch the plots horizontally.
+# 3. Increase 'height' to accommodate all the rows (since 3 cols = many rows).
+ggsave(file.path(outs_dir, "plots/qc/interaction_scatterplots.pdf"), plot = p, width = 15, height = 40, limitsize = FALSE)
+```
+
+### Plot interaction correlation for combinations with >= 100 significant interactions
+
+```{r}
+ggplot(correlation_results, aes(x = pearson_corr)) +
+  geom_histogram(binwidth = 0.05) +
+  labs(
+    title = "Distribution of Pearson Correlations", 
+    subtitle = "SIG07 vs SIG13 Interaction Term LFC",
+    x = "Pearson Correlation",
+    y = "Count"
+  ) +
+  theme(aspect.ratio = 1) +
+  xlim(0,1) 
+```
+
+## Single-Term LFC Correlation
+
+### Wrangle data
+
+```{r}
+sig07_data_singles <- read_csv(file.path(imports_dir, "SIG07/analysis_outs/glmGamPoi/glmGamPoi_interaction/glmGamPoi_singles_lfc_0.05filter.csv"))
+sig13_data_singles <- read.csv(file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/glmGamPoi_single_term/glmGamPoi_singleTerm_lfc_0.05filter.csv"))
+```
+
+```{r}
+sig13_data_singles_filtered <- sig13_data_singles %>%
+  filter(condition %in% sig07_data_singles$interaction) %>%
+  rename(interaction = condition)
+joint_singles <- inner_join(sig07_data_singles, sig13_data_singles_filtered, by = c("name", "interaction"), suffix = c(".sig07", ".sig13"))
+```
+
+### Get correlation grouped by interaction and ligand 
+
+```{r}
+ligand_correlations_singles <- joint_singles %>%
+  group_by(interaction) %>% 
+  summarise(
+    pearson_corr = cor(lfc.sig13, lfc.sig07, method = "pearson"),
+    # It is often helpful to count how many genes are driving this correlation
+    n_genes = n(), 
+    .groups = "drop"
+  ) %>%
+  arrange(desc(pearson_corr))
+
+# View the results
+print(ligand_correlations_singles)
+```
+
+```{r}
+ggplot(ligand_correlations_singles, aes(x = pearson_corr)) +
+  geom_histogram(binwidth = 0.05) +
+  labs(
+    title = "Distribution of Pearson Correlations", 
+    subtitle = "SIG07 vs SIG13 Single Term LFC",
+    x = "Pearson Correlation",
+    y = "Count"
+  ) +
+  theme(aspect.ratio = 1) +
+  xlim(0,1) 
+ggsave(file.path(outs_dir, "plots/qc/SIG07_SIG13_pearson_corr_single_term.pdf"))
+```
+

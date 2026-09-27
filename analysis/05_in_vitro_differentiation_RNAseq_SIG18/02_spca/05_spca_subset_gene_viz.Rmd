@@ -1,0 +1,368 @@
+---
+title: "sPCA component subset visualization"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup}
+library(tidyverse)
+library(patchwork)
+library(purrr)
+library(ggpubr)
+library(ggrepel)
+library(rstatix)
+library(RColorBrewer)
+library(circlize)
+library(ComplexHeatmap)
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Repo-relative paths: inputs from imports_stable/, outputs to analysis_outs/<module>/
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "05_in_vitro_differentiation_RNAseq_SIG18")
+dir.create(file.path(outs_dir, "plots"), recursive = TRUE, showWarnings = FALSE)
+source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
+theme_set(theme_Publication())
+interaction_palette <- c("#808080",brewer.pal(5,"Dark2"))
+names(interaction_palette) <- c("none", "additive over saturation", "buffering", 
+                      "buffering complete", "synergy negative", "synergy positive")
+
+tab20_colors <- c(
+      "#1F77B4", "#AEC7E8", "#FF7F0E", "#FFBB78", "#2CA02C", "#98DF8A",
+      "#D62728", "#FF9896", "#9467BD", "#C5B0D5", "#8C564B", "#C49C94",
+      "#E377C2", "#F7B6D2", "#7F7F7F", "#C7C7C7", "#BCBD22", "#DBDB8D",
+      "#17BECF", "#9EDAE5"
+    )
+```
+
+# Goal
+
+Visualize gene-level changes in synergistic components identified in SIG18
+
+# Import
+
+```{r}
+norm_counts <- read.csv(file.path(imports_dir, "SIG18/processing_outs/norm_counts_matrix_umiDeDup_SIG18.csv"), row.names = "X")
+spca_genes <- read_csv(file.path(imports_dir, "SIG18/analysis_outs/spca/zscore_degs_alpha10.0_sPCA_loadings.csv"))
+```
+
+```{r}
+bad_samples <- colnames(norm_counts)[grepl("mouse4|mouse9", colnames(norm_counts))]
+columns_to_keep <- setdiff(colnames(norm_counts), bad_samples)
+norm_counts <- norm_counts[,columns_to_keep]
+```
+
+# Define Synergy Comps
+
+```{r}
+lm_fit <- read_csv(file.path(imports_dir, "SIG18/analysis_outs/spca/lm_fit_zscore_degs_alpha10.0_sPCA_clean.csv"))
+lm_scored <- read_csv(file.path(imports_dir, "SIG18/analysis_outs/spca/lm_scored_zscore_degs_alpha10.0_sPCA_clean.csv"))
+```
+
+```{r}
+synergy_pos_comps <- lm_scored %>%
+  filter(interaction_class == "synergy positive") %>%
+  filter(`freq_synergy positive` > 0.25) %>%
+  pull(component) %>%
+  unique()
+synergy_neg_comps <- lm_scored %>%
+  filter(interaction_class == "synergy negative") %>%
+  filter((`freq_synergy negative` > 0.25)|(freq_buffering > 0.25)) %>%
+  pull(component) %>%
+  unique()
+Th1_top <- lm_fit %>%
+  filter(!(component %in% synergy_pos_comps)) %>%
+  filter(term == "ligand1Th1") %>%
+  slice_min(p_adj, n = 3) %>%
+  pull(component)
+Th2_top <- lm_fit %>%
+  filter(!(component %in% synergy_pos_comps)) %>%
+  filter(term == "ligand1Th2") %>%
+  slice_min(p_adj, n = 3) %>%
+  pull(component)
+Th17_top <- lm_fit %>%
+  filter(!(component %in% synergy_pos_comps)) %>%
+  filter(term == "ligand1Th17") %>%
+  slice_min(p_adj, n = 3) %>%
+  pull(component)
+iTreg_top <- lm_fit %>%
+  filter(!(component %in% synergy_pos_comps)) %>%
+  filter(term == "ligand1iTreg") %>%
+  slice_min(p_adj, n = 3) %>%
+  pull(component)
+```
+
+
+# HM
+
+```{r}
+draw_top_hm <- function(comp_name, num_genes = 50) {
+  comp = comp_name
+  comp_genes <- spca_genes %>%
+    filter(spca_component == comp) %>%
+    slice_max(order_by = loading, n = num_genes) %>%
+    pull(gene)
+  
+  mat <- norm_counts[comp_genes, ]
+  # Scale rows (genes); result is [genes x samples]
+  mat_scaled <- t(apply(mat, 1, scale))
+  colnames(mat_scaled) <- colnames(mat)
+   
+  # Prepare sample metadata
+  col_meta <- tibble(sample = colnames(mat_scaled)) %>%
+    separate_wider_delim(
+      sample,
+      delim = "_",
+      names = c("ligand1", "ligand2", "mouse", "sex", "well", "column", "project"),
+      cols_remove = FALSE
+    ) %>%
+    mutate(interaction = paste0(ligand1, "_", ligand2)) %>%
+    mutate(interaction = factor(
+      interaction,
+      c(
+        "Th0_none", "Th0_TNF",
+        "Th1_none", "Th1_TNF",
+        "Th2_none", "Th2_TNF",
+        "Th17_none", "Th17_TNF",
+        "iTreg_none", "iTreg_TNF",
+        "TGFb_none", "TGFb_TNF"
+      )
+    )) %>%
+    column_to_rownames("sample") %>%
+    arrange(interaction)
+  
+  # Align matrix columns to metadata rows
+  mat_scaled <- mat_scaled[, rownames(col_meta)]
+   
+  # Colors
+  col_fun <- colorRamp2(seq(-4, 4, length.out = 11), rev(brewer.pal(n = 11, name = "RdBu")))
+  ints <- unique(col_meta$interaction)
+  int_cols <- setNames(colorRampPalette(brewer.pal(12, "Paired"))(length(ints)), ints)
+   
+  # Column Annotation (changed from rowAnnotation)
+  ha <- HeatmapAnnotation(
+    interaction = col_meta$interaction,
+    col = list(interaction = int_cols),
+    annotation_legend_param = list(interaction = list(title = "interaction"))
+  )
+   
+  # Heatmap
+  Heatmap(
+    mat_scaled,           # No transpose needed here (Genes on Rows, Samples on Cols)
+    name = "scaled sPCA loadings",
+    col = col_fun,
+    cluster_rows = F,  # Cluster the genes
+    cluster_columns = FALSE, # Do not cluster samples (keep interaction order)
+    show_row_names = TRUE,
+    show_column_names = FALSE,
+    show_row_dend = FALSE,
+    top_annotation = ha,  # Annotation goes on top
+    border_gp = gpar(col = "black"),
+    column_title = paste0(comp, "\ntop ",num_genes," genes"),
+    heatmap_legend_param = list(title = "scaled counts", color_bar = "continuous")
+  )
+}
+```
+
+```{r, fig.height=4, fig.width=5}
+draw_top_hm("comp_36", num_genes = 20)
+pdf(file.path(outs_dir, "plots/SIG18_comp_36_hm.pdf"), width = 6, height = 4)
+draw_top_hm("comp_36", num_genes = 20)
+dev.off()
+```
+
+```{r, fig.height=4, fig.width=5}
+draw_top_hm("comp_54", num_genes = 20)
+pdf(file.path(outs_dir, "plots/SIG18_comp_54_hm.pdf"), width = 6, height = 4)
+draw_top_hm("comp_54", num_genes = 20)
+dev.off()
+```
+```{r, fig.height=4, fig.width=5}
+draw_top_hm("comp_38", num_genes = 20)
+pdf(file.path(outs_dir, "plots/SIG18_comp_38_hm.pdf"), width = 5, height = 4)
+draw_top_hm("comp_38", num_genes = 20)
+dev.off()
+```
+
+```{r, fig.height=4, fig.width=5}
+draw_top_hm("comp_47", num_genes = 20)
+pdf(file.path(outs_dir, "plots/SIG18_comp_47_hm.pdf"), width = 5, height = 4)
+draw_top_hm("comp_47", num_genes = 20)
+dev.off()
+```
+
+```{r, fig.height=4, fig.width=5}
+draw_top_hm("comp_4", num_genes = 20)
+pdf(file.path(outs_dir, "plots/SIG18_comp_4_hm.pdf"), width = 5, height = 4)
+draw_top_hm("comp_4", num_genes = 20)
+dev.off()
+```
+
+
+```{r, fig.height=4, fig.width=5}
+draw_top_hm("comp_30", num_genes = 20)
+pdf(file.path(outs_dir, "plots/SIG18_comp_30_hm.pdf"), width = 5, height = 4)
+draw_top_hm("comp_30", num_genes = 20)
+dev.off()
+```
+
+```{r, fig.height=4, fig.width=5}
+draw_top_hm("comp_19", num_genes = 20)
+pdf(file.path(outs_dir, "plots/SIG18_comp_19_hm.pdf"), width = 5, height = 4)
+draw_top_hm("comp_19", num_genes = 20)
+dev.off()
+```
+
+# HM Subset (Interaction Levels, Set2)
+
+```{r}
+interaction_levels <- c(
+  "Th0_none",
+  "Th1_none",
+  "Th2_none",
+  "Th17_none",
+  "iTreg_none", "Th0_TNF",
+  "TGFb_none", "TGFb_TNF"
+)
+```
+
+```{r}
+draw_top_hm_subset <- function(comp_name, num_genes = 50) {
+  comp = comp_name
+  comp_genes <- spca_genes %>%
+    filter(spca_component == comp) %>%
+    slice_max(order_by = loading, n = num_genes) %>%
+    pull(gene)
+
+  mat <- norm_counts[comp_genes, ]
+  # Scale rows (genes); result is [genes x samples]
+  mat_scaled <- t(apply(mat, 1, scale))
+  colnames(mat_scaled) <- colnames(mat)
+
+  # Prepare sample metadata
+  col_meta <- tibble(sample = colnames(mat_scaled)) %>%
+    separate_wider_delim(
+      sample,
+      delim = "_",
+      names = c("ligand1", "ligand2", "mouse", "sex", "well", "column", "project"),
+      cols_remove = FALSE
+    ) %>%
+    mutate(interaction = paste0(ligand1, "_", ligand2)) %>%
+    filter(interaction %in% interaction_levels) %>%
+    mutate(interaction = factor(interaction, levels = interaction_levels)) %>%
+    column_to_rownames("sample") %>%
+    arrange(interaction)
+
+  # Align matrix columns to metadata rows
+  mat_scaled <- mat_scaled[, rownames(col_meta)]
+
+  # Colors
+  col_fun <- colorRamp2(seq(-4, 4, length.out = 11), rev(brewer.pal(n = 11, name = "RdBu")))
+  int_cols <- setNames(brewer.pal(length(interaction_levels), "Set2"), interaction_levels)
+
+  # Column Annotation
+  ha <- HeatmapAnnotation(
+    interaction = col_meta$interaction,
+    col = list(interaction = int_cols),
+    annotation_legend_param = list(interaction = list(title = "interaction"))
+  )
+
+  # Heatmap
+  Heatmap(
+    mat_scaled,           # No transpose needed here (Genes on Rows, Samples on Cols)
+    name = "scaled sPCA loadings",
+    col = col_fun,
+    cluster_rows = F,  # Cluster the genes
+    cluster_columns = FALSE, # Do not cluster samples (keep interaction order)
+    show_row_names = TRUE,
+    show_column_names = FALSE,
+    show_row_dend = FALSE,
+    top_annotation = ha,  # Annotation goes on top
+    border_gp = gpar(col = "black"),
+    column_title = paste0(comp, "\ntop ",num_genes," genes"),
+    heatmap_legend_param = list(title = "scaled counts", color_bar = "continuous")
+  )
+}
+```
+
+```{r, fig.height=4, fig.width=5}
+draw_top_hm_subset("comp_36", num_genes = 20)
+pdf(file.path(outs_dir, "plots/SIG18_comp_36_hm_subset.pdf"), width = 6, height = 4)
+draw_top_hm_subset("comp_36", num_genes = 20)
+dev.off()
+```
+
+```{r, fig.height=4, fig.width=5}
+draw_top_hm_subset("comp_54", num_genes = 20)
+pdf(file.path(outs_dir, "plots/SIG18_comp_54_hm_subset.pdf"), width = 6, height = 4)
+draw_top_hm_subset("comp_54", num_genes = 20)
+dev.off()
+```
+
+```{r, fig.height=4, fig.width=5}
+draw_top_hm_subset("comp_38", num_genes = 20)
+pdf(file.path(outs_dir, "plots/SIG18_comp_38_hm_subset.pdf"), width = 5, height = 4)
+draw_top_hm_subset("comp_38", num_genes = 20)
+dev.off()
+```
+
+```{r, fig.height=4, fig.width=5}
+draw_top_hm_subset("comp_47", num_genes = 20)
+pdf(file.path(outs_dir, "plots/SIG18_comp_47_hm_subset.pdf"), width = 5, height = 4)
+draw_top_hm_subset("comp_47", num_genes = 20)
+dev.off()
+```
+
+```{r, fig.height=4, fig.width=5}
+draw_top_hm_subset("comp_4", num_genes = 20)
+pdf(file.path(outs_dir, "plots/SIG18_comp_4_hm_subset.pdf"), width = 5, height = 4)
+draw_top_hm_subset("comp_4", num_genes = 20)
+dev.off()
+```
+
+```{r, fig.height=4, fig.width=5}
+draw_top_hm_subset("comp_30", num_genes = 20)
+pdf(file.path(outs_dir, "plots/SIG18_comp_30_hm_subset.pdf"), width = 5, height = 4)
+draw_top_hm_subset("comp_30", num_genes = 20)
+dev.off()
+```
+
+```{r, fig.height=4, fig.width=5}
+draw_top_hm_subset("comp_19", num_genes = 20)
+pdf(file.path(outs_dir, "plots/SIG18_comp_19_hm_subset.pdf"), width = 5, height = 4)
+draw_top_hm_subset("comp_19", num_genes = 20)
+dev.off()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

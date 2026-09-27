@@ -1,0 +1,669 @@
+---
+title: "spca_hm_synergistic_viz"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup}
+library(tidyverse)
+library(patchwork)
+library(viridisLite)
+library(ggrepel)
+library(ComplexHeatmap)
+library(circlize)
+library(RColorBrewer)
+library(ggpointdensity)
+library(scales)
+library(viridisLite)
+knitr::opts_chunk$set(echo = TRUE)
+set.seed(314)
+```
+
+```{r}
+# Repo-relative paths: inputs from imports_stable/, outputs to analysis_outs/<module>/
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "05_in_vitro_differentiation_RNAseq_SIG18")
+dir.create(file.path(outs_dir, "plots"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(outs_dir, "spca"), recursive = TRUE, showWarnings = FALSE)
+source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
+theme_set(theme_Publication())
+interaction_palette <- c("#808080",brewer.pal(5,"Dark2"))
+names(interaction_palette) <- c("none", "additive over saturation", "buffering",
+                      "buffering complete", "synergy negative", "synergy positive")
+```
+
+# Import
+
+```{r}
+# import ligand component values
+codes <- readr::read_csv(file.path(imports_dir, "SIG18/analysis_outs/spca/zscore_degs/zscore_degs_unscaled_alpha10.0_sPCA_codes.csv")) 
+colnames(codes)[-1] <- paste0("comp_",colnames(codes)[-1])
+codes <- codes %>%
+  separate(interaction, into = c("ligand1","ligand2","replicate","sex","well","library","project"), sep = "_") %>%
+  dplyr::select(-c(library, project)) %>%
+  mutate(interaction = paste0(ligand1, "_", ligand2))
+```
+
+
+```{r}
+lm_fit <- read_csv(file.path(imports_dir, "SIG18/analysis_outs/spca/lm_fit_zscore_degs_alpha10.0_sPCA_clean.csv"))
+lm_scored <- read_csv(file.path(imports_dir, "SIG18/analysis_outs/spca/lm_scored_zscore_degs_alpha10.0_sPCA_clean.csv")) %>%
+  mutate(interaction_class = factor(interaction_class, levels = c("none","buffering","synergy negative","synergy positive")))
+
+# unfiltered interaction model output, used to identify replicate-driven components
+# that were excluded from lm_scored/lm_fit during annotation in 03_spca_annotation.Rmd
+lm_interaction <- read_csv(file.path(imports_dir, "SIG18/analysis_outs/spca/lm_fit_zscore_degs_alpha10.0_sPCA.csv"))
+bad_rep_comps <- setdiff(unique(lm_interaction$component), unique(lm_scored$component))
+```
+
+# sPCA HM Visualization
+
+```{r, fig.height=4, fig.width=12}
+mat <- codes %>%
+  dplyr::select(-all_of(bad_rep_comps)) %>%
+  mutate(interaction = paste(ligand1, ligand2, sep = "_")) %>%
+  dplyr::mutate(across(where(is.numeric), ~ as.numeric(scale(.x)))) %>%
+  group_by(interaction) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE), .groups = "drop") %>%
+  column_to_rownames("interaction") %>%
+  as.matrix()
+
+col_fun <- colorRamp2(
+  seq(-4, 4, length.out = 11),
+  rev(brewer.pal(n = 11, name = "RdBu"))
+)
+
+# Plot
+Heatmap(
+  mat,
+  name = "scaled sPCA loadings",
+  col = col_fun,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  border_gp = gpar(col = "black"),
+  column_title = "sPCA components across interactions\nmean across replicates",
+  heatmap_legend_param = list(
+    title = "scaled sPCA\nloadings",
+    color_bar = "continuous"
+  )
+)
+```
+
+
+```{r, fig.height=12, fig.width=12}
+# matrix
+mat <- codes %>%
+  dplyr::select(-bad_rep_comps) %>%
+  mutate(sample = paste(ligand1, ligand2, replicate, sep = "_"),
+         interaction = paste(ligand1, ligand2, sep = "_")) %>%
+  mutate(across(where(is.numeric), ~ as.numeric(scale(.x)))) %>%
+  column_to_rownames("sample") %>%
+  dplyr::select(starts_with("comp_")) %>%
+  as.matrix()
+
+# row metadata (interaction), aligned to mat rows
+row_meta <- codes %>%
+  mutate(sample = paste(ligand1, ligand2, replicate, sep = "_"),
+         interaction = paste(ligand1, ligand2, sep = "_")) %>%
+  distinct(sample, interaction) %>%
+  column_to_rownames("sample")
+row_meta <- row_meta[rownames(mat), , drop = FALSE]
+
+# colors
+col_fun <- colorRamp2(seq(-5, 5, length.out = 11),
+                      rev(brewer.pal(n = 11, name = "RdBu")))
+ints <- unique(row_meta$interaction)
+int_cols <- setNames(
+  colorRampPalette(brewer.pal(12, "Paired"))(length(ints)),
+  ints
+)
+
+# row annotation
+ra <- rowAnnotation(
+  interaction = row_meta$interaction,
+  col = list(interaction = int_cols),
+  annotation_legend_param = list(interaction = list(title = "interaction"))
+)
+
+# heatmap
+Heatmap(
+  mat,
+  name = "scaled sPCA loadings",
+  col = col_fun,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  left_annotation = ra,
+  border_gp = gpar(col = "black"),
+  column_title = "sPCA components across interactions\nmean across replicates",
+  heatmap_legend_param = list(
+    title = "scaled sPCA\nloadings",
+    color_bar = "continuous"
+  )
+)
+
+```
+
+
+```{r, fig.height=5, fig.width=12}
+class_levels <- setdiff(names(interaction_palette), "none")
+# make heatmap matrix (interactions as rows, components as columns — dropped the final t())
+mat <- codes %>%
+  dplyr::select(-bad_rep_comps) %>%
+  mutate(interaction = paste(ligand1, ligand2, sep = "_")) %>%
+  dplyr::mutate(across(where(is.numeric), ~ as.numeric(scale(.x)))) %>%
+  group_by(interaction) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE), .groups = "drop") %>%
+  column_to_rownames("interaction") %>%
+  as.matrix()
+# make heatmap color scale
+col_fun <- colorRamp2(seq(-4, 4, length.out = 11), rev(brewer.pal(11, "RdBu")))
+# make bar plot data (rows = component, matches mat's columns now)
+bar_mat <- lm_scored %>%
+  filter(p_adj_interaction < 0.1 | p_adj_ligand1 < 0.1 | p_adj_ligand2 < 0.1) %>%
+  filter(interaction_class %in% class_levels) %>%
+  mutate(interaction_class = factor(interaction_class, levels = class_levels)) %>%
+  dplyr::count(component, interaction_class, name = "n") %>%
+  complete(component, interaction_class, fill = list(n = 0)) %>%
+  pivot_wider(names_from = interaction_class, values_from = n, names_expand = TRUE, values_fill = 0) %>%
+  column_to_rownames("component") %>% as.matrix()
+# align bar_mat to mat's columns without dropping any of mat's components
+missing_comps <- setdiff(colnames(mat), rownames(bar_mat))
+bar_mat <- rbind(bar_mat, matrix(0, nrow = length(missing_comps), ncol = ncol(bar_mat),
+                                  dimnames = list(missing_comps, colnames(bar_mat))))
+bar_mat <- bar_mat[colnames(mat), class_levels, drop = FALSE]
+
+bars <- HeatmapAnnotation(
+  num_interactions = anno_barplot(bar_mat, gp = gpar(fill = interaction_palette[class_levels]),
+                       axis_param = list(side = "left")),
+  height = unit(45, "mm")
+)
+ht <- Heatmap(mat, name = "scaled sPCA loadings", col = col_fun,
+              cluster_rows = TRUE, cluster_columns = TRUE,
+              row_names_side = "left",
+              top_annotation = bars,
+              border_gp = gpar(col = "black"),
+              heatmap_legend_param = list(title = "scaled\nsPCA\nloadings",
+                                          at = seq(-4, 4, by = 2),
+                                          color_bar = "continuous",
+                                          border = "black"))
+bar_legend <- Legend(title = "interaction class", at = class_levels,
+                     legend_gp = gpar(fill = interaction_palette[class_levels]))
+ht_obj <- draw(ht, annotation_legend_list = list(bar_legend),
+     heatmap_legend_side = "right", annotation_legend_side = "right")
+# component order from hierarchical clustering, reused by 06_spca_ora_analysis.Rmd
+# to keep sPCA components in a consistent order across figures
+clustered_rows <- tibble(component = colnames(mat)[column_order(ht_obj)])
+```
+
+```{r}
+pdf(file.path(outs_dir, "plots/spca_alpha10.0_interactions_hm.pdf"), width = 12, height = 5)
+draw(ht, annotation_legend_list = list(bar_legend),
+     heatmap_legend_side = "right", annotation_legend_side = "right")
+dev.off()
+
+write_csv(clustered_rows, file.path(outs_dir, "spca/spca_alpha10.0_full_hm_row_order.csv"))
+```
+
+# Interactions per Combination
+
+```{r, fig.height=4, fig.width=6}
+# number of significant interaction components per ligand combination,
+# stacked by interaction class (same filtering as the heatmap bar annotation)
+combo_counts <- lm_scored %>%
+  filter(p_adj_interaction < 0.1 | p_adj_ligand1 < 0.1 | p_adj_ligand2 < 0.1) %>%
+  filter(interaction_class %in% class_levels) %>%
+  mutate(interaction_class = factor(interaction_class, levels = class_levels)) %>%
+  dplyr::count(interaction, interaction_class, name = "n") %>%
+  complete(interaction, interaction_class, fill = list(n = 0))
+
+# order combinations by total number of interaction components
+combo_order <- combo_counts %>%
+  group_by(interaction) %>%
+  summarise(total = sum(n), .groups = "drop") %>%
+  arrange(desc(total)) %>%
+  pull(interaction)
+
+p_combo <- combo_counts %>%
+  mutate(interaction = factor(interaction, levels = combo_order)) %>%
+  ggplot(aes(x = interaction, y = n, fill = interaction_class)) +
+  geom_col(color = "black", linewidth = 0.2) +
+  scale_fill_manual(values = interaction_palette[class_levels], name = "interaction class") +
+  labs(x = "ligand combination", y = "number of sPCA components") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        aspect.ratio = 1)
+p_combo
+
+ggsave(file.path(outs_dir, "plots/spca_alpha10.0_interactions_per_combination_bar.pdf"),
+       p_combo)
+```
+
+# Define Synergy Comps
+
+```{r}
+synergy_pos_comps <- lm_scored %>%
+  filter(interaction_class == "synergy positive") %>%
+  filter(`freq_synergy positive` > 0.25) %>%
+  pull(component) %>%
+  unique()
+synergy_pos_comps_tgfb <- lm_scored %>%
+  filter(interaction_class == "synergy positive") %>%
+  filter(interaction == "TGFb_TNF") %>%
+  filter(`freq_synergy positive` > 0.25) %>%
+  pull(component) %>%
+  unique()
+synergy_neg_comps <- lm_scored %>%
+  filter(interaction_class == "synergy negative") %>%
+  filter((`freq_synergy negative` > 0.25)|(freq_buffering > 0.25)) %>%
+  pull(component) %>%
+  unique()
+Th1_top <- lm_fit %>%
+  filter(!(component %in% synergy_pos_comps)) %>%
+  filter(term == "ligand1Th1") %>%
+  slice_min(p_adj, n = 3) %>%
+  pull(component)
+Th2_top <- lm_fit %>%
+  filter(!(component %in% synergy_pos_comps)) %>%
+  filter(term == "ligand1Th2") %>%
+  slice_min(p_adj, n = 3) %>%
+  pull(component)
+Th17_top <- lm_fit %>%
+  filter(!(component %in% synergy_pos_comps)) %>%
+  filter(term == "ligand1Th17") %>%
+  slice_min(p_adj, n = 3) %>%
+  pull(component)
+iTreg_top <- lm_fit %>%
+  filter(!(component %in% synergy_pos_comps)) %>%
+  filter(term == "ligand1iTreg") %>%
+  slice_min(p_adj, n = 3) %>%
+  pull(component)
+```
+
+# Heatmap All Pos Synergy Comps
+
+```{r, fig.width=5, fig.height=5}
+# Define the specific order for the categories
+cat_levels <- c("combination", "single")
+
+# define comps
+comps <- synergy_pos_comps
+
+# subset and apply factor order
+codesTnf <- codes %>%
+  mutate(category = case_when(
+    ligand2 == "none" ~ "single",
+    ligand1 == "Th0" ~ "single",
+    TRUE ~ "combination"
+  )) %>%
+  mutate(category = factor(category, levels = cat_levels)) %>%
+  dplyr::select(interaction, replicate, category, all_of(comps))
+
+# Prepare data
+mat_prep <- codesTnf %>%
+  group_by(interaction, category) %>%
+  summarise(across(where(is.numeric), ~ mean(.x, na.rm = TRUE))) %>%
+  ungroup() %>%
+  dplyr::mutate(across(where(is.numeric), ~ as.numeric(scale(.x))))
+
+# Transpose
+mat <- mat_prep %>%
+  dplyr::select(-category) %>%
+  column_to_rownames("interaction") %>%
+  as.matrix() %>%
+  t()
+
+# Color function
+col_fun <- colorRamp2(seq(-4, 4, length.out = 11), rev(brewer.pal(n = 11, name = "RdBu")))
+
+# Plot with cluster_column_slices = FALSE to respect factor order
+Heatmap(
+  mat,
+  name = "scaled sPCA loadings",
+  col = col_fun,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_row_dend = T,
+  show_column_dend = T,
+  border_gp = gpar(col = "black"),
+  column_split = mat_prep$category,
+  cluster_column_slices = FALSE, # This enforces the factor level order
+  column_title = "TNF family sPCA synergy components",
+  heatmap_legend_param = list(title = "Row Scaled\nsPCA Score")
+)
+```
+
+```{r}
+pdf(file.path(outs_dir, "plots/SIG18_spca_tnf_family_interaction_programs.pdf"), width = 5, height = 5)
+Heatmap(
+  mat,
+  name = "scaled sPCA loadings",
+  col = col_fun,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_row_dend = T,
+  show_column_dend = T,
+  border_gp = gpar(col = "black"),
+  column_split = mat_prep$category,
+  cluster_column_slices = FALSE, # This enforces the factor level order
+  column_title = "TNF family sPCA synergy components",
+  heatmap_legend_param = list(title = "Row Scaled\nsPCA Score")
+)
+dev.off()
+```
+
+# Heatmap TGFb+TNF Pos Synergy Comps
+
+```{r, fig.width=5, fig.height=4}
+# Define the specific order for the categories
+cat_levels <- c("combination", "single")
+
+# define comps
+comps <- synergy_pos_comps_tgfb
+
+# subset and apply factor order
+codesTnf <- codes %>%
+  mutate(category = case_when(
+    ligand2 == "none" ~ "single",
+    ligand1 == "Th0" ~ "single",
+    TRUE ~ "combination"
+  )) %>%
+  mutate(category = factor(category, levels = cat_levels)) %>%
+  dplyr::select(interaction, replicate, category, all_of(comps))
+
+# Prepare data
+mat_prep <- codesTnf %>%
+  group_by(interaction, category) %>%
+  summarise(across(where(is.numeric), ~ mean(.x, na.rm = TRUE))) %>%
+  ungroup() %>%
+  dplyr::mutate(across(where(is.numeric), ~ as.numeric(scale(.x))))
+
+# Transpose
+mat <- mat_prep %>%
+  dplyr::select(-c(category)) %>%
+  column_to_rownames("interaction") %>%
+  as.matrix() %>%
+  t()
+
+# Color function
+col_fun <- colorRamp2(seq(-4, 4, length.out = 11), rev(brewer.pal(n = 11, name = "RdBu")))
+
+# Plot with cluster_column_slices = FALSE to respect factor order
+Heatmap(
+  mat,
+  name = "scaled sPCA loadings",
+  col = col_fun,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_row_dend = T,
+  show_column_dend = T,
+  border_gp = gpar(col = "black"),
+  column_split = mat_prep$category,
+  cluster_column_slices = FALSE, # This enforces the factor level order
+  column_title = "TGFb+TNF sPCA pos synergy components",
+  heatmap_legend_param = list(title = "Row Scaled\nsPCA Score")
+)
+```
+
+```{r, fig.width=6, fig.height=3}
+pdf(file.path(outs_dir, "plots/SIG18_spca_tgfb_tnf_interaction_programs.pdf"), width = 5, height = 4)
+Heatmap(
+  mat,
+  name = "scaled sPCA loadings",
+  col = col_fun,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_row_dend = T,
+  show_column_dend = T,
+  border_gp = gpar(col = "black"),
+  column_split = mat_prep$category,
+  cluster_column_slices = FALSE, # This enforces the factor level order
+  column_title = "TGFb+TNF sPCA pos synergy components",
+  heatmap_legend_param = list(title = "Row Scaled\nsPCA Score")
+)
+dev.off()
+```
+
+```{r, fig.width=6, fig.height=3}
+# Define the specific order for the categories
+cat_levels <- c("combination", "single")
+
+# Define the specific order for interaction
+interaction_levels <- c(
+  "Th0_none", "Th0_TNF",
+  "Th1_none", "Th1_TNF",
+  "Th2_none", "Th2_TNF",
+  "Th17_none", "Th17_TNF",
+  "iTreg_none", "iTreg_TNF",
+  "TGFb_none", "TGFb_TNF"
+)
+
+# define comps
+comps <- synergy_pos_comps_tgfb
+
+# subset and apply factor order
+codesTnf <- codes %>%
+  mutate(category = case_when(
+    ligand2 == "none" ~ "single",
+    ligand1 == "Th0" ~ "single",
+    TRUE ~ "combination"
+  )) %>%
+  mutate(category = factor(category, levels = cat_levels)) %>%
+  mutate(interaction = factor(interaction, levels = interaction_levels)) %>%
+  dplyr::select(interaction, replicate, category, all_of(comps))
+
+# Prepare data
+mat_prep <- codesTnf %>%
+  dplyr::mutate(across(where(is.numeric), ~ as.numeric(scale(.x)))) %>%
+  arrange(interaction, replicate)
+
+# Transpose
+mat <- mat_prep %>%
+  mutate(interaction_rep = paste(interaction, replicate, sep = "__")) %>%
+  dplyr::select(-c(category, interaction, replicate)) %>%
+  column_to_rownames("interaction_rep") %>%
+  as.matrix() %>%
+  t()  # transpose so comps are rows, samples are columns
+
+# Color function for heatmap body
+col_fun <- colorRamp2(seq(-4, 4, length.out = 11), rev(brewer.pal(n = 11, name = "RdBu")))
+
+# Color mapping for interaction annotation (Paired palette, matched to factor order)
+interaction_colors <- setNames(
+  brewer.pal(n = length(interaction_levels), name = "Paired"),
+  interaction_levels
+)
+
+# Column annotation
+col_anno <- HeatmapAnnotation(
+  interaction = mat_prep$interaction,
+  col = list(interaction = interaction_colors),
+  annotation_name_side = "left"
+)
+
+# Plot with cluster_row_slices = FALSE to respect factor order
+Heatmap(
+  mat,
+  name = "scaled sPCA loadings",
+  col = col_fun,
+  cluster_rows = TRUE,
+  cluster_columns = F,
+  show_row_dend = T,
+  show_column_dend = T,
+  show_column_names = F,
+  border_gp = gpar(col = "black"),
+  cluster_column_slices = FALSE, # This enforces the factor level order
+  top_annotation = col_anno,
+  column_title = "TGFb+TNF sPCA positive synergy components",
+  heatmap_legend_param = list(title = "Row Scaled\nsPCA Score")
+)
+
+pdf(file.path(outs_dir, "plots/SIG18_spca_tgfb_tnf_interaction_programs_replicates.pdf"), width = 6, height = 3)
+Heatmap(
+  mat,
+  name = "scaled sPCA loadings",
+  col = col_fun,
+  cluster_rows = TRUE,
+  cluster_columns = F,
+  show_row_dend = T,
+  show_column_dend = T,
+  show_column_names = F,
+  border_gp = gpar(col = "black"),
+  cluster_column_slices = FALSE, # This enforces the factor level order
+  top_annotation = col_anno,
+  column_title = "TGFb+TNF sPCA positive synergy components",
+  heatmap_legend_param = list(title = "Row Scaled\nsPCA Score")
+)
+dev.off()
+```
+
+```{r, fig.width=6, fig.height=3}
+# Define the specific order for the categories
+cat_levels <- c("combination", "single")
+
+# Define the specific order for interaction
+interaction_levels <- c(
+  "Th0_none",
+  "Th1_none", 
+  "Th2_none", 
+  "Th17_none", 
+  "iTreg_none", "Th0_TNF",
+  "TGFb_none", "TGFb_TNF"
+)
+
+# define comps
+comps <- synergy_pos_comps_tgfb
+
+# subset and apply factor order
+codesTnf <- codes %>%
+  mutate(category = case_when(
+    ligand2 == "none" ~ "single",
+    ligand1 == "Th0" ~ "single",
+    TRUE ~ "combination"
+  )) %>%
+  mutate(category = factor(category, levels = cat_levels)) %>%
+  filter(interaction %in% interaction_levels) %>%
+  mutate(interaction = factor(interaction, levels = interaction_levels)) %>%
+  dplyr::select(interaction, replicate, category, all_of(comps))
+
+# Prepare data
+mat_prep <- codesTnf %>%
+  dplyr::mutate(across(where(is.numeric), ~ as.numeric(scale(.x)))) %>%
+  arrange(interaction, replicate)
+
+# Transpose
+mat <- mat_prep %>%
+  mutate(interaction_rep = paste(interaction, replicate, sep = "__")) %>%
+  dplyr::select(-c(category, interaction, replicate)) %>%
+  column_to_rownames("interaction_rep") %>%
+  as.matrix() %>%
+  t()  # transpose so comps are rows, samples are columns
+
+# Color function for heatmap body
+col_fun <- colorRamp2(seq(-4, 4, length.out = 11), rev(brewer.pal(n = 11, name = "RdBu")))
+
+# Color mapping for interaction annotation (Paired palette, matched to factor order)
+interaction_colors <- setNames(
+  brewer.pal(n = length(interaction_levels), name = "Set2"),
+  interaction_levels
+)
+
+# Column annotation
+col_anno <- HeatmapAnnotation(
+  interaction = mat_prep$interaction,
+  col = list(interaction = interaction_colors),
+  annotation_name_side = "left"
+)
+
+# Plot with cluster_row_slices = FALSE to respect factor order
+Heatmap(
+  mat,
+  name = "scaled sPCA loadings",
+  col = col_fun,
+  cluster_rows = TRUE,
+  cluster_columns = F,
+  show_row_dend = T,
+  show_column_dend = T,
+  show_column_names = F,
+  border_gp = gpar(col = "black"),
+  cluster_column_slices = FALSE, # This enforces the factor level order
+  top_annotation = col_anno,
+  column_title = "TGFb+TNF sPCA positive synergy components",
+  heatmap_legend_param = list(title = "Row Scaled\nsPCA Score")
+)
+
+pdf(file.path(outs_dir, "plots/SIG18_spca_tgfb_tnf_interaction_programs_replicates_Th_only.pdf"), width = 6, height = 3)
+Heatmap(
+  mat,
+  name = "scaled sPCA loadings",
+  col = col_fun,
+  cluster_rows = TRUE,
+  cluster_columns = F,
+  show_row_dend = T,
+  show_column_dend = T,
+  show_column_names = F,
+  border_gp = gpar(col = "black"),
+  cluster_column_slices = FALSE, # This enforces the factor level order
+  top_annotation = col_anno,
+  column_title = "TGFb+TNF sPCA positive synergy components",
+  heatmap_legend_param = list(title = "Row Scaled\nsPCA Score")
+)
+dev.off()
+```
+
+# FC-FC synergy scores
+
+```{r, fig.height=5, fig.width=5}
+lm_scored %>%
+  filter(interaction == "TGFb_TNF") %>%
+  mutate(estimate_additive = estimate_ligand1 + estimate_ligand2) %>%
+  ggplot(aes(x = estimate_additive, y = estimate_total_interaction_model)) +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_point(aes(color = interaction_class)) +
+  scale_color_manual(values = interaction_palette) +
+  theme(aspect.ratio = 1)
+ggsave(file.path(outs_dir, "plots/SIG18_spca_tgfb_tnf_coefficient_scatter.pdf"))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

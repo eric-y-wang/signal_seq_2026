@@ -1,0 +1,194 @@
+---
+title: "Ligand Activity Regressions: Inflammation Atlas"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE)
+source("regression_helpers.R")
+```
+
+# Goal
+
+Test which SIG13 ligand activities differ between each inflammatory disease and
+healthy controls in the Inflammation Atlas CD4 T cells, using the activity scores
+from `02_score_disease_datasets.py`.
+
+Three models, all contrasting each disease against `healthy`:
+
+1. **Disease** -- one value per patient, across all CD4 T cells
+2. **Naive vs non-naive** (`Level1`, Tregs excluded) -- disease x celltype
+3. **Fine celltype** (`Level2`) -- disease x celltype
+
+**Covariates:** sex, scaled continuous age, and 10x chemistry in all three models.
+
+**Samples with no recorded age are dropped from every model.** Age is missing
+(stored as the string `"nan"`) for 110 of the 816 patients, ~13%. Because all three
+models adjust for continuous age, those samples cannot contribute, so
+`drop_missing_age()` below removes them explicitly and prints the count for each
+table -- rather than leaving `lm`'s `na.omit` to discard them silently. The
+`binned_age` column would instead retain them as an explicit missing level, at the
+cost of treating age as categorical.
+
+The earlier analysis mixed the two parameterizations -- `binned_age` in models 1-2,
+continuous age in model 3 -- so those models were fit on different sample sets
+without that being visible.
+
+`studyID` is deliberately *not* a covariate: each study contributes only specific
+diseases, so it is collinear with disease. `chemistry` partly stands in for it and is
+estimable because the healthy controls span 12 studies and several chemistries.
+
+# Import
+
+```{r}
+ATLAS_KEYS <- c("studyID", "sampleID", "patientID", "disease", "sex", "age",
+                "binned_age", "chemistry", "diseaseGroup")
+
+atlas <- load_activity_scores("inflammation_atlas", ATLAS_KEYS)
+
+# celltype tables: the celltype is the last key, renamed to `celltype` throughout
+atlas_level1 <- load_activity_scores("inflammation_atlas_celltypeLevel1_noTregs",
+                                     c(ATLAS_KEYS, "Level1")) %>%
+  rename(celltype = Level1)
+atlas_level2 <- load_activity_scores("inflammation_atlas_celltypeLevel2",
+                                     c(ATLAS_KEYS, "Level2")) %>%
+  rename(celltype = Level2)
+
+activities <- activity_names()
+cat(nrow(atlas), "samples,", length(activities), "ligand activities\n")
+```
+
+```{r}
+#' Every model adjusts for binned age, so samples with no binned age (stored
+#' as the string "nan") cannot contribute. They are dropped here explicitly, with a
+#' count, rather than silently by `lm`'s na.omit.
+drop_missing_age <- function(df, label) {
+  df <- mutate(df, age = as.numeric(age))
+  cat(sprintf("%-22s dropping %3d of %4d samples with no recorded binned age\n",
+              label, sum(is.na(df$binned_age)), nrow(df)))
+  df %>%
+    filter(!is.na(binned_age)) %>%
+    # a disease can lose every sample (see the QC table below); dropping the empty
+    # factor level keeps emmeans from building contrasts it cannot estimate
+    droplevels()
+}
+```
+
+```{r}
+# one patient per row? (the disease model averages within patient regardless)
+cat(nrow(atlas), "samples from", n_distinct(atlas$patientID), "patients\n")
+atlas %>% count(disease, name = "samples") %>% arrange(desc(samples))
+```
+
+# Covariate QC
+
+Confirm no covariate tracks disease so strongly that it cannot be adjusted for.
+
+
+Note that in some cases binned_age is provided but age is not. Hence in the bottom plot
+`flu` is recorded without age for all 11 of its patients, but binned_age is present.
+
+```{r, fig.height=4, fig.width=6}
+atlas %>%
+  mutate(age = as.numeric(age)) %>%
+  ggplot(aes(x = disease, y = age, fill = disease)) +
+  geom_boxplot(show.legend = FALSE, na.rm = TRUE) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Age by disease", x = "", y = "age")
+```
+
+```{r, fig.height=10, fig.width=15}
+map(c("sex", "chemistry", "studyID"), function(variable) {
+  ggplot(atlas, aes(x = disease, fill = !!sym(variable))) +
+    geom_bar(position = "fill") +
+    scale_y_continuous(labels = scales::percent) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(title = paste(variable, "by disease"), x = "", y = "proportion")
+}) %>% wrap_plots(ncol = 2)
+```
+
+The healthy controls are reasonably balanced; `studyID` is confounded with disease
+by construction (each study contributes specific diseases) and so is not modelled.
+
+# Disease associations
+
+One row per patient (averaging any repeat samples), each disease vs `healthy`.
+
+```{r}
+data_disease <- atlas %>%
+  group_by(studyID, patientID, disease, sex, age, binned_age, chemistry, diseaseGroup) %>%
+  summarise(across(all_of(activities), mean), .groups = "drop") %>%
+  mutate(across(c(disease, sex, chemistry, studyID), factor)) %>%
+  drop_missing_age("disease")
+
+res_disease <- fit_and_save(
+  data_disease,
+  rhs = "disease + sex + binned_age + chemistry",
+  emm = ~ disease,
+  contrast_args = list(method = "trt.vs.ctrl", ref = "healthy"),
+  name = "inflammation_atlas_disease"
+)
+```
+
+```{r, fig.height=12, fig.width=12}
+res_disease %>%
+  ggplot(aes(x = estimate, y = -log10(padj))) +
+  geom_point(size = 0.8) +
+  geom_hline(yintercept = 1, linetype = "dotted", color = "red") +
+  facet_wrap(~contrast) +
+  labs(title = "Ligand activity vs healthy, by disease")
+```
+
+# Celltype associations
+
+## Naive vs non-naive (Level1, Tregs excluded)
+
+```{r}
+data_level1 <- atlas_level1 %>%
+  mutate(across(c(disease, sex, chemistry, celltype), factor)) %>%
+  drop_missing_age("celltype Level1")
+
+res_level1 <- fit_and_save(
+  data_level1,
+  rhs = "disease * celltype + sex + binned_age + chemistry",
+  emm = ~ disease | celltype,
+  contrast_args = list(method = "trt.vs.ctrl", ref = "healthy"),
+  padj_by = c("contrast", "celltype"),
+  name = "inflammation_atlas_celltype_level1"
+)
+```
+
+## Fine celltypes (Level2)
+
+`rg.limit` is raised because the disease x celltype reference grid is large.
+
+```{r}
+data_level2 <- atlas_level2 %>%
+  mutate(across(c(disease, sex, chemistry, celltype), factor)) %>%
+  drop_missing_age("celltype Level2")
+
+res_level2 <- fit_and_save(
+  data_level2,
+  rhs = "disease * celltype + sex + binned_age + chemistry",
+  emm = ~ disease | celltype,
+  contrast_args = list(method = "trt.vs.ctrl", ref = "healthy"),
+  padj_by = c("contrast", "celltype"),
+  name = "inflammation_atlas_celltype_level2",
+  rg.limit = 20000
+)
+```
+
+```{r}
+res_level2 %>%
+  filter(padj < 0.1) %>%
+  count(celltype, name = "significant_activity_contrasts") %>%
+  arrange(desc(significant_activity_contrasts))
+```
+
+Results are written to `analysis_outs/03_activity_inference_model/inference_model_disease_bulk/regressions/`
+and visualized in `08_viz_inflammation_atlas.Rmd`.

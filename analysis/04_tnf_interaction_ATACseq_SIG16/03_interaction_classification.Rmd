@@ -1,0 +1,856 @@
+---
+title: "SIG16 ATAC: interaction scoring and classification of accessible peaks"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    html_preview: false
+---
+
+```{r setup}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(patchwork)
+  library(RColorBrewer)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(data.table)
+})
+knitr::opts_chunk$set(echo = TRUE)
+
+# Repo-relative paths (inputs: imports_stable/, outputs: analysis_outs/)
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "04_tnf_interaction_ATACseq_SIG16")
+source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
+theme_set(theme_Publication())
+
+set.seed(1)
+
+idr <- 0.05
+job.name <- paste0("idr-", idr, "/")
+
+IN_DIR   <- file.path(imports_dir, "SIG16/analysis_outs/deseq2-merged-reps", job.name)
+OUT_DIR  <- file.path(outs_dir, "deseq2-merged-reps", job.name)
+PLOT_DIR <- file.path(outs_dir, "plots_new", "deseq2-merged-reps", job.name)
+
+# SIG13 gates both branches of the classifier on FDR alone. The |LFC| gate applied to
+# both branches below is an ATAC-specific addition (see "Deviations").
+padj.int.cutoff  <- 0.05
+padj.cond.cutoff <- 0.05
+lfc.cutoff       <- log2(1.5)
+
+# SIG13's interaction-class palette, verbatim from
+# analysis/02_combinatorial_screen_signalseq_SIG13/07_spca/04_spca_visualization.Rmd. Two of the six labels
+# ("additive over saturation", "buffering complete") require the double-dose
+# conditions SIG16 does not have, so they never occur here; the names are kept
+# so colours stay identical across the two repos.
+interaction_palette <- c("#808080", brewer.pal(5, "Dark2"))
+names(interaction_palette) <- c("none", "additive over saturation", "buffering",
+                                "buffering complete", "synergy negative", "synergy positive")
+
+class_levels <- c("none", "buffering", "synergy negative", "synergy positive")
+itxn_levels  <- setdiff(class_levels, "none")
+```
+
+# Goal
+
+Score and classify every peak by how the combined `ligand1 + TNF` response compares to the
+additive expectation, using **the same definition as the sibling RNA repo `SIG13`**
+(`analysis/02_combinatorial_screen_signalseq_SIG13/05_interaction_scoring/interaction_scoring_v3.R`) so that chromatin and
+transcriptional interactions are directly comparable.
+
+Writing $b_1$, $b_2$, $b_{int}$ for the ligand1, TNF and interaction coefficients of the
+`~ mouse + ligand1 + ligand2 + ligand1:ligand2` fit:
+
+$$
+\text{lfc\_additive\_expected} = b_1 + b_2
+\qquad
+\text{lfc\_total\_interaction\_model} = b_1 + b_2 + b_{int}
+$$
+
+$$
+\text{interaction score} = \frac{b_{int}}{b_1 + b_2 + b_{int}}
+$$
+
+The score is the **fraction of the total combined effect attributable to the interaction term**,
+signed relative to that total. Positive means the interaction pushes in the same direction as the
+combined response (amplification); negative means it pushes against it (dampening). It is set to
+`0` when the interaction term is not significant.
+
+`lfc_condition` / `adj_pval_condition` come from the mode-6 contrast added in
+`02_differential_accessibility.Rmd` (`{ligand1}_TNF` vs `none_none`, i.e. $b_1 + b_2 + b_{int}$
+tested directly). It plays the role of SIG13's joint-condition GLM: it decides whether a peak
+responds to the combination at all.
+
+Classes, evaluated sequentially (`case_when`, first match wins):
+
+| class | rule | meaning |
+|---|---|---|
+| **synergy positive** | interaction significant, total > 0, score > 0 | peak opens in the combination, and the interaction amplifies the opening |
+| **synergy negative** | interaction significant, total < 0, score > 0 | peak closes in the combination, and the interaction amplifies the closing |
+| **buffering** | interaction significant, score < 0 | interaction opposes the combined effect (sub-additive / antagonistic / saturating) |
+| **none** | interaction not significant, but the combined response is significant | peak responds to the combination, additively |
+| `NA` | otherwise | peak does not respond to the combination; dropped by every downstream filter |
+
+Because `interaction_score > 0` requires $b_{int}$ and the total to share a sign, the first two
+branches are exactly "both positive" and "both negative", and `buffering` catches every remaining
+significant-interaction peak.
+
+## Deviations from SIG13
+
+1. **Magnitude gate, on both branches.** SIG13 gates on FDR alone. Here a term must additionally
+   clear `log2(1.5)` to count, consistent with the LFC cutoff used everywhere else in this repo:
+   the interaction branch requires `|b_int| > log2(1.5)`, and the `none` branch requires
+   `|lfc_condition| > log2(1.5)` on top of `adj_pval_condition <= 0.05`.
+
+   The second half matters more than it looks. With ~24k peaks in the atlas and a strong global
+   TNF response, FDR alone stays significant far below any meaningful effect size — ungated,
+   roughly half the `none` peaks per ligand had `|lfc_condition| < log2(1.5)`, down to ~1.09-fold.
+   Gating both branches makes `none` mean the same thing `02_differential_accessibility.Rmd`
+   means by "significant", so the classes reconcile against its mode-6 tally: gated `none` plus
+   the interaction-class peaks that also clear the condition gate equals `02_`'s significant-peak
+   count for `condition_{L}_TNF_vs_none_none` exactly.
+
+   Note this is a gate on the classifier, not on the interaction branch's meaning: an interaction
+   class is assigned before the `none` branch is reached and never required the combined response
+   to be significant, which is SIG13's behaviour. Most interaction peaks do not clear the
+   condition gate, so the classes are not a partition of "peaks responding to the combination".
+2. **Non-finite guard.** When `lfc_total_interaction_model` is exactly `0` the score is `Inf`/`NaN`.
+   SIG13 does not handle this explicitly (those genes fall through to `none`/`NA`); here the
+   `is.finite()` guard makes that behaviour deliberate rather than incidental.
+3. **Joins, not row indexing.** `prepare.result.tb.CnR` drops peaks with `padj = NA`, so the four
+   result tables per ligand cover different peak sets (the IL6 interaction table has half the atlas).
+   The table is built by `left_join` from the condition table, mirroring SIG13's `left_join` from
+   `conditionLfc`, so missing coefficients surface as `NA` rather than being silently mis-indexed.
+
+## Known caveat, inherited from SIG13
+
+`interaction_score` is a ratio with `lfc_total_interaction_model` in the denominator. When the
+additive expectation is near zero, the total collapses onto $b_{int}$ itself and the score tends to
+1 for *any* nonzero interaction coefficient — so peaks with a small additive expectation are pulled
+mechanically toward a "synergy" call. This is characterised against an empirical null in
+`analysis/02_combinatorial_screen_signalseq_SIG13/06_interaction_scoring_null/04_synergy_buffering_magnitude_test.Rmd`. The formula is
+kept as-is for comparability; the `lfc_additive_expected` vs `lfc_condition` scatter below is the
+panel that makes the artifact visible.
+
+# Import
+
+```{r}
+md <- readRDS(file.path(IN_DIR, "metadata.rds"))
+normalized_counts <- readRDS(file.path(IN_DIR, "normalized_counts.rds"))
+expr.mtx <- dplyr::select(normalized_counts, c(-distanceToTSS, -geneSymbol))
+pal <- readRDS(file.path(imports_dir, "SIG16/analysis_outs/plots/palette.rds"))
+
+ligand2  <- "TNF"
+ligand1s <- c("TGFb", "IL6", "IL4")
+```
+
+# Scoring and classification
+
+```{r}
+read_res <- function(subdir, cols) {
+  df <- readRDS(file.path(IN_DIR, subdir, "unshrunken-res.table.rds"))
+  out <- df[, c("feature", "log2FoldChange", "padj", "geneSymbol", "distanceToTSS")]
+  names(out) <- c("name", cols[1], cols[2], "geneSymbol", "distanceToTSS")
+  tibble::as_tibble(out)
+}
+
+score_interaction <- function(l1, l2 = "TNF") {
+  itxn <- paste0("ligand1", l1, ".ligand2", l2)
+
+  res.cond <- read_res(paste0("contrast-condition_", l1, "_", l2, "_vs_none_none"),
+                       c("lfc_condition", "adj_pval_condition"))
+  res.l1   <- read_res(paste0("name-ligand1_", l1, "_vs_none"),
+                       c("lfc_ligand1", "adj_pval_ligand1"))
+  res.l2   <- read_res(paste0("name-ligand2_", l2, "_vs_none"),
+                       c("lfc_ligand2", "adj_pval_ligand2"))
+  res.int  <- read_res(paste0("name-", itxn),
+                       c("lfc_interaction", "adj_pval_interaction"))
+
+  # start from the condition model, as SIG13 starts from conditionLfc
+  df <- res.cond %>%
+    left_join(dplyr::select(res.l1,  -geneSymbol, -distanceToTSS), by = "name") %>%
+    left_join(dplyr::select(res.l2,  -geneSymbol, -distanceToTSS), by = "name") %>%
+    left_join(dplyr::select(res.int, -geneSymbol, -distanceToTSS), by = "name") %>%
+    mutate(interaction = paste0(l1, "_", l2), .after = name)
+
+  df <- df %>%
+    mutate(
+      sig_int = !is.na(adj_pval_interaction) &
+                adj_pval_interaction <= padj.int.cutoff &
+                abs(lfc_interaction) > lfc.cutoff,
+      lfc_additive_expected       = lfc_ligand1 + lfc_ligand2,
+      lfc_total_interaction_model = lfc_ligand1 + lfc_ligand2 + lfc_interaction,
+      interaction_score = if_else(sig_int,
+                                  lfc_interaction / lfc_total_interaction_model,
+                                  0),
+      interaction_class = case_when(
+        sig_int & is.finite(interaction_score) &
+          lfc_total_interaction_model > 0 & interaction_score > 0 ~ "synergy positive",
+        sig_int & is.finite(interaction_score) &
+          lfc_total_interaction_model < 0 & interaction_score > 0 ~ "synergy negative",
+        sig_int & is.finite(interaction_score) &
+          interaction_score < 0                                   ~ "buffering",
+        !is.na(adj_pval_condition) &
+          adj_pval_condition <= padj.cond.cutoff &
+          abs(lfc_condition) > lfc.cutoff                         ~ "none",
+        TRUE ~ NA_character_),
+      interaction_class = factor(interaction_class, levels = class_levels)) %>%
+    dplyr::select(-sig_int)
+
+  attr(df, "dir.itxn") <- paste0("name-", itxn)
+  attr(df, "ligand1")  <- l1
+  df
+}
+
+scored <- set_names(map(ligand1s, score_interaction, l2 = ligand2), ligand1s)
+```
+
+## Sanity check: the mode-6 contrast really is $b_1 + b_2 + b_{int}$
+
+If this is not ~0 the 3-term list contrast in `02_` was built wrong and every class below is junk.
+
+```{r}
+map_dfr(scored, function(df) {
+  d <- df$lfc_condition - df$lfc_total_interaction_model
+  tibble(n_compared = sum(is.finite(d)), max_abs_diff = max(abs(d), na.rm = TRUE))
+}, .id = "ligand1")
+```
+
+# Summary counts
+
+```{r}
+summary.tb <- map_dfr(scored, function(df) {
+  df %>% count(interaction_class, .drop = FALSE)
+}, .id = "ligand1") %>%
+  mutate(interaction_class = fct_na_value_to_level(interaction_class, "NA")) %>%
+  pivot_wider(names_from = ligand1, values_from = n, values_fill = 0)
+summary.tb
+```
+
+# Plots
+
+```{r}
+plot_class_bar <- function(df, l1) {
+  ggplot(subset(df, !is.na(interaction_class)),
+         aes(x = interaction_class, fill = interaction_class)) +
+    geom_bar() +
+    geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.4, size = 3) +
+    scale_fill_manual(values = interaction_palette, guide = "none") +
+    scale_y_log10() +
+    labs(title = paste0(l1, " x ", ligand2), x = NULL, y = "Number of peaks") +
+    theme(axis.text.x = element_text(angle = 25, hjust = 1),
+          aspect.ratio = 2)
+}
+
+# SIG13's manuscript panel: additive expectation vs the measured combined effect,
+# with the additive diagonal. Peaks off the diagonal are the interacting ones.
+plot_additive_scatter <- function(df, l1) {
+  d <- subset(df, !is.na(interaction_class))
+  d <- d[order(d$interaction_class), ]   # draw "none" first, interactions on top
+  ggplot(d, aes(x = lfc_additive_expected, y = lfc_condition, color = interaction_class)) +
+    geom_point(size = 0.4, alpha = 0.5) +
+    geom_abline(intercept = 0, slope = 1, color = "black", linetype = "dashed") +
+    scale_color_manual(values = interaction_palette, name = NULL) +
+    guides(color = guide_legend(override.aes = list(size = 2, alpha = 1))) +
+    labs(title = paste0(l1, " x ", ligand2),
+         x = expression(b[1] + b[2]~"(additive expectation)"),
+         y = expression(b[1] + b[2] + b[int]~"(combined effect)")) +
+    coord_fixed()
+}
+
+plot_score_scatter <- function(df, l1) {
+  d <- subset(df, !is.na(interaction_class) & interaction_class != "none" &
+                is.finite(interaction_score))
+  ggplot(d, aes(x = lfc_total_interaction_model, y = interaction_score,
+                color = interaction_class)) +
+    geom_point(size = 0.6, alpha = 0.7) +
+    geom_hline(yintercept = 0, color = "gray50", linetype = "dashed") +
+    geom_vline(xintercept = 0, color = "gray50", linetype = "dashed") +
+    scale_color_manual(values = interaction_palette, name = NULL) +
+    guides(color = guide_legend(override.aes = list(size = 2, alpha = 1))) +
+    labs(title = paste0(l1, " x ", ligand2),
+         x = expression(b[1] + b[2] + b[int]), y = "interaction score")
+}
+```
+
+```{r, results='asis', fig.width=16, fig.height=6, message=FALSE, warning=FALSE}
+for (l1 in ligand1s) {
+  df <- scored[[l1]]
+  dir.itxn <- attr(df, "dir.itxn")
+  dir.create(file.path(PLOT_DIR, dir.itxn), recursive = TRUE, showWarnings = FALSE)
+
+  cat("\n\n## ", l1, " x ", ligand2, "\n\n", sep = "")
+
+  bar.p  <- plot_class_bar(df, l1)
+  add.p  <- plot_additive_scatter(df, l1)
+  scr.p  <- plot_score_scatter(df, l1)
+
+  ggsave(file.path(PLOT_DIR, dir.itxn, "bar-interaction-classification.pdf"),
+         bar.p, width = 5, height = 6)
+  ggsave(file.path(PLOT_DIR, dir.itxn, "scatter-additive-vs-combined.pdf"),
+         add.p, width = 8, height = 8)
+  ggsave(file.path(PLOT_DIR, dir.itxn, "scatter-interaction-score.pdf"),
+         scr.p, width = 8, height = 6)
+
+  print(bar.p + add.p + scr.p)
+}
+```
+
+# Heatmaps
+
+Three pairs of heatmaps, one pair per `ligand1`. Columns are the four conditions of that
+2 x 2 block — `none_none`, `{ligand1}_none`, `none_TNF`, `{ligand1}_TNF` — in that fixed order;
+rows are peaks faceted by interaction class. Values are VST-normalized accessibility, z-scored
+per peak.
+
+For each ligand: `...-all.pdf` keeps every classified peak (four facets, including the additive
+`none` peaks) and `...-interactions-only.pdf` keeps only the three interaction classes.
+
+Rows are ordered by `lfc_condition` within each facet rather than clustered — the `none` facet
+runs to tens of thousands of peaks, where hierarchical clustering is not tractable and orders
+the rows by something less interpretable than effect size anyway.
+
+```{r}
+n.row.labels <- 5    # peaks labelled per class, by |interaction score| then |lfc_condition|
+max.named.rows <- 80 # at or below this many rows every row gets its own name instead
+
+# Colour scale for the heatmap matrix. Values are per-peak z-scores of VST accessibility,
+# so the scale is symmetric about 0 and the same for every heatmap below. `heatmap.limit`
+# is where the ramp saturates -- lower it to make modest differences more visible, raise it
+# to compress them. Replace `heatmap.col` outright with any circlize::colorRamp2() to use a
+# different set of colours.
+heatmap.limit <- 5
+heatmap.col <- colorRamp2(
+  seq(-heatmap.limit, heatmap.limit, length.out = 9),
+  c("#173c68", "#1c5785", "#166db0", "#a6d1e3", "#ffffff",
+    "#f09173", "#d46052", "#b32339", "#690822"))
+
+interaction_heatmap <- function(df, l1, l2 = "TNF", drop.none = FALSE, save = TRUE) {
+  conditions <- c("none_none", paste0(l1, "_none"),
+                  paste0("none_", l2), paste0(l1, "_", l2))
+
+  cells <- rownames(md)[md$condition %in% conditions]
+  md.sub <- md[cells, ]
+  md.sub$condition <- factor(as.character(md.sub$condition), levels = conditions)
+  md.sub <- md.sub[order(md.sub$condition), ]
+  cells <- rownames(md.sub)
+
+  wanted <- if (drop.none) itxn_levels else class_levels
+  d <- df %>%
+    filter(!is.na(interaction_class), interaction_class %in% wanted,
+           name %in% rownames(expr.mtx)) %>%
+    mutate(interaction_class = factor(as.character(interaction_class), levels = wanted)) %>%
+    arrange(interaction_class, desc(lfc_condition))
+
+  if (nrow(d) == 0) return(NULL)
+
+  # classes with no peaks would otherwise appear as an empty slice and a dead legend key
+  d$interaction_class <- droplevels(d$interaction_class)
+  keep.levels <- levels(d$interaction_class)
+
+  # Small sets get every row named outright; large ones fall back to `anno_mark`
+  # on the top few per class, since 500+ row names are unreadable either way.
+  name.all.rows <- nrow(d) <= max.named.rows
+  # peaks further than the 50 kb cutoff carry no symbol, so fall back to the peak ID
+  # rather than leaving those rows blank
+  display.labels <- ifelse(is.na(d$geneSymbol) | d$geneSymbol == "", d$name, d$geneSymbol)
+
+  row.labels <- d %>%
+    filter(geneSymbol != "", !is.na(geneSymbol)) %>%
+    group_by(interaction_class) %>%
+    arrange(desc(abs(interaction_score)), desc(abs(lfc_condition)), .by_group = TRUE) %>%
+    slice_head(n = n.row.labels) %>%
+    ungroup() %>%
+    dplyr::select(feature = name, geneSymbol)
+
+  # the annotation name would sit in the bottom-left corner and collide with the
+  # row-slice titles; the legend already names it
+  la <- rowAnnotation(
+    `interaction class` = d$interaction_class,
+    col = setNames(list(interaction_palette[keep.levels]), "interaction class"),
+    show_annotation_name = FALSE, show_legend = TRUE)
+
+  ca.col <- list(condition = pal$condition[conditions],
+                 ligand1 = pal$ligand1, ligand2 = pal$ligand2)
+
+  ca <- columnAnnotation(df = md.sub[cells, c("condition", "ligand1", "ligand2")],
+                         col = ca.col)
+
+  # large sets get sparse `anno_mark` callouts on the right instead of row names
+  ra <- if (!name.all.rows && nrow(row.labels) > 0) {
+    rowAnnotation(foo = anno_mark(at = match(row.labels$feature, d$name),
+                                  labels = row.labels$geneSymbol,
+                                  labels_gp = gpar(fontsize = 9)))
+  } else NULL
+
+  # z-score each peak across the four conditions of this block
+  expr <- t(scale(t(expr.mtx[d$name, cells])))
+
+  ht <- Heatmap(
+    matrix = expr, name = "normalized\naccessibility", col = heatmap.col,
+    top_annotation = ca, left_annotation = la, right_annotation = ra,
+    column_split = md.sub[cells, "condition"], row_split = d$interaction_class,
+    cluster_columns = FALSE, cluster_column_slices = FALSE,
+    cluster_rows = FALSE, cluster_row_slices = FALSE,
+    show_column_names = TRUE, show_row_names = name.all.rows,
+    row_labels = display.labels, row_names_side = "right",
+    row_names_gp = gpar(fontface = "italic", fontsize = 7),
+    column_title_rot = 25, use_raster = TRUE,
+    # in the all-classes heatmap the three interaction slices are <5% of the height,
+    # so their titles would overprint each other; the colour strip carries the labels
+    # wrapped onto two lines so the label fits inside the shorter synergy slices
+    row_title = if (drop.none) gsub(" ", "\n", keep.levels) else rep("", length(keep.levels)),
+    row_title_gp = gpar(fontsize = 10))
+
+  title <- paste0(l1, " x ", l2, " - ",
+                  paste(paste0(levels(d$interaction_class), ": ",
+                               as.integer(table(d$interaction_class))),
+                        collapse = ", "))
+
+  if (save) {
+    suffix <- if (drop.none) "interactions-only" else "all"
+    pdf(file.path(PLOT_DIR, attr(df, "dir.itxn"),
+                  paste0("heatmap-interaction-classes-", suffix, ".pdf")),
+        width = 9, height = if (name.all.rows) max(6, nrow(d) * 0.14 + 3) else 10)
+    ComplexHeatmap::draw(ht, column_title = title,
+                         column_title_gp = gpar(fontsize = 11))
+    invisible(dev.off())
+  }
+  list(ht = ht, n = nrow(d), title = title)
+}
+```
+
+## TGFb x TNF - all classified peaks
+
+Saved to `heatmap-interaction-classes-all.pdf`.
+
+```{r, fig.width=9, fig.height=10, message=FALSE, warning=FALSE}
+h.tgfb.all <- interaction_heatmap(scored[["TGFb"]], "TGFb", ligand2, drop.none = FALSE)
+if (is.null(h.tgfb.all)) {
+  message("No peaks in this set.")
+} else {
+  ComplexHeatmap::draw(h.tgfb.all$ht,
+                       column_title = h.tgfb.all$title,
+                       column_title_gp = gpar(fontsize = 11))
+}
+```
+
+## TGFb x TNF - interaction classes only
+
+Saved to `heatmap-interaction-classes-interactions-only.pdf`.
+
+```{r, fig.width=9, fig.height=10, message=FALSE, warning=FALSE}
+h.tgfb.interactions.only <- interaction_heatmap(scored[["TGFb"]], "TGFb", ligand2, drop.none = TRUE)
+if (is.null(h.tgfb.interactions.only)) {
+  message("No peaks in this set.")
+} else {
+  ComplexHeatmap::draw(h.tgfb.interactions.only$ht,
+                       column_title = h.tgfb.interactions.only$title,
+                       column_title_gp = gpar(fontsize = 11))
+}
+```
+
+## TGFb x TNF synergy-positive peaks across every condition
+
+The heatmaps above are restricted to the 2 x 2 block the class was called in, so they cannot
+show whether a TGFb x TNF synergy-positive peak is specific to that pair or also opens under
+IL4 or IL6. This one keeps the same row set but widens the columns to all eight conditions,
+z-scoring each peak across all 24 libraries (so the values are not comparable to the block
+heatmaps above, which z-score within four conditions).
+
+Saved to `heatmap-synergy-positive-all-conditions.pdf` under the TGFb interaction directory.
+
+```{r}
+# Same row set as `interaction_heatmap`, but columns are every condition rather than the
+# 2 x 2 block, and rows are never split (a single class is plotted at a time).
+class_heatmap_all_conditions <- function(df, l1, cls = "synergy positive", save = TRUE) {
+  conditions <- levels(md$condition)
+
+  md.sub <- md[order(md$condition), ]
+  cells  <- rownames(md.sub)
+
+  d <- df %>%
+    filter(!is.na(interaction_class), interaction_class == cls,
+           name %in% rownames(expr.mtx)) %>%
+    arrange(desc(lfc_condition))
+
+  if (nrow(d) == 0) return(NULL)
+
+  name.all.rows <- nrow(d) <= max.named.rows
+  display.labels <- ifelse(is.na(d$geneSymbol) | d$geneSymbol == "", d$name, d$geneSymbol)
+
+  row.labels <- d %>%
+    filter(geneSymbol != "", !is.na(geneSymbol)) %>%
+    arrange(desc(abs(interaction_score)), desc(abs(lfc_condition))) %>%
+    slice_head(n = n.row.labels) %>%
+    dplyr::select(feature = name, geneSymbol)
+
+  ca <- columnAnnotation(
+    df  = md.sub[cells, c("condition", "ligand1", "ligand2")],
+    col = list(condition = pal$condition[conditions],
+               ligand1 = pal$ligand1, ligand2 = pal$ligand2))
+
+  ra <- if (!name.all.rows && nrow(row.labels) > 0) {
+    rowAnnotation(foo = anno_mark(at = match(row.labels$feature, d$name),
+                                  labels = row.labels$geneSymbol,
+                                  labels_gp = gpar(fontsize = 9)))
+  } else NULL
+
+  # z-score each peak across all 24 libraries, not just the 2 x 2 block
+  expr <- t(scale(t(expr.mtx[d$name, cells])))
+
+  ht <- Heatmap(
+    matrix = expr, name = "normalized\naccessibility", col = heatmap.col,
+    top_annotation = ca, right_annotation = ra,
+    column_split = md.sub[cells, "condition"],
+    cluster_columns = FALSE, cluster_column_slices = FALSE,
+    cluster_rows = T,
+    show_column_names = TRUE, show_row_names = name.all.rows,
+    row_labels = display.labels, row_names_side = "right",
+    row_names_gp = gpar(fontface = "italic", fontsize = 7),
+    column_title_rot = 25, use_raster = TRUE)
+
+  title <- paste0(l1, " x ", ligand2, " ", cls, " peaks (n = ", nrow(d),
+                  ") across all conditions")
+
+  if (save) {
+    pdf(file.path(PLOT_DIR, attr(df, "dir.itxn"),
+                  paste0("heatmap-", gsub(" ", "-", cls), "-all-conditions.pdf")),
+        width = 11, height = if (name.all.rows) max(6, nrow(d) * 0.14 + 3) else 10)
+    ComplexHeatmap::draw(ht, column_title = title, column_title_gp = gpar(fontsize = 11))
+    invisible(dev.off())
+  }
+  list(ht = ht, n = nrow(d), title = title)
+}
+```
+
+```{r, fig.width=11, fig.height=10, message=FALSE, warning=FALSE}
+h.tgfb.synpos.all.cond <- class_heatmap_all_conditions(scored[["TGFb"]], "TGFb",
+                                                       "synergy positive")
+if (is.null(h.tgfb.synpos.all.cond)) {
+  message("No peaks in this set.")
+} else {
+  ComplexHeatmap::draw(h.tgfb.synpos.all.cond$ht,
+                       column_title = h.tgfb.synpos.all.cond$title,
+                       column_title_gp = gpar(fontsize = 11))
+}
+```
+
+## IL6 x TNF - all classified peaks
+
+Saved to `heatmap-interaction-classes-all.pdf`.
+
+```{r, fig.width=9, fig.height=10, message=FALSE, warning=FALSE}
+h.il6.all <- interaction_heatmap(scored[["IL6"]], "IL6", ligand2, drop.none = FALSE)
+if (is.null(h.il6.all)) {
+  message("No peaks in this set.")
+} else {
+  ComplexHeatmap::draw(h.il6.all$ht,
+                       column_title = h.il6.all$title,
+                       column_title_gp = gpar(fontsize = 11))
+}
+```
+
+## IL6 x TNF - interaction classes only
+
+Saved to `heatmap-interaction-classes-interactions-only.pdf`.
+
+```{r, fig.width=9, fig.height=10, message=FALSE, warning=FALSE}
+h.il6.interactions.only <- interaction_heatmap(scored[["IL6"]], "IL6", ligand2, drop.none = TRUE)
+if (is.null(h.il6.interactions.only)) {
+  message("No peaks in this set.")
+} else {
+  ComplexHeatmap::draw(h.il6.interactions.only$ht,
+                       column_title = h.il6.interactions.only$title,
+                       column_title_gp = gpar(fontsize = 11))
+}
+```
+
+## IL4 x TNF - all classified peaks
+
+Saved to `heatmap-interaction-classes-all.pdf`.
+
+```{r, fig.width=9, fig.height=10, message=FALSE, warning=FALSE}
+h.il4.all <- interaction_heatmap(scored[["IL4"]], "IL4", ligand2, drop.none = FALSE)
+if (is.null(h.il4.all)) {
+  message("No peaks in this set.")
+} else {
+  ComplexHeatmap::draw(h.il4.all$ht,
+                       column_title = h.il4.all$title,
+                       column_title_gp = gpar(fontsize = 11))
+}
+```
+
+## IL4 x TNF - interaction classes only
+
+Saved to `heatmap-interaction-classes-interactions-only.pdf`.
+
+```{r, fig.width=9, fig.height=10, message=FALSE, warning=FALSE}
+h.il4.interactions.only <- interaction_heatmap(scored[["IL4"]], "IL4", ligand2, drop.none = TRUE)
+if (is.null(h.il4.interactions.only)) {
+  message("No peaks in this set.")
+} else {
+  ComplexHeatmap::draw(h.il4.interactions.only$ht,
+                       column_title = h.il4.interactions.only$title,
+                       column_title_gp = gpar(fontsize = 11))
+}
+```
+
+# Export
+
+Column schema matches SIG13's `interactions_scored_v3_glmGamPoi_*.csv`, plus the ATAC-only
+`geneSymbol` / `distanceToTSS` / `lfc_additive_expected` columns.
+
+```{r}
+walk(scored, function(df) {
+  dir.itxn <- attr(df, "dir.itxn")
+  out <- df %>%
+    dplyr::select(name, interaction, lfc_condition, adj_pval_condition,
+                  adj_pval_ligand1, adj_pval_ligand2, lfc_ligand1, lfc_ligand2,
+                  lfc_interaction, adj_pval_interaction, lfc_additive_expected,
+                  lfc_total_interaction_model, interaction_score, interaction_class,
+                  geneSymbol, distanceToTSS)
+
+  dir.create(file.path(OUT_DIR, dir.itxn), recursive = TRUE, showWarnings = FALSE)
+  write.csv(out, file.path(OUT_DIR, dir.itxn, "interaction-classification.csv"),
+            row.names = FALSE)
+  write.csv(subset(out, !is.na(interaction_class)),
+            file.path(OUT_DIR, dir.itxn, "interaction-classification-sig.csv"),
+            row.names = FALSE)
+  write.csv(count(out, interaction_class, .drop = FALSE),
+            file.path(OUT_DIR, dir.itxn, "interaction-classification-summary.csv"),
+            row.names = FALSE)
+})
+```
+
+# Combined `interScored` table, joined to SIG13 and SIG18 RNA
+
+The three per-ligand tables are concatenated into one `interScored` table covering all
+`ligand1 x TNF` pairs, and the interaction classes from the two RNA repos — **SIG13** (array
+perturbation screen, scRNA) and **SIG18** (bulk RNA of polarized CD4 subsets +/- TNF) — are joined
+onto it by gene symbol so that peaks can be asked to agree with the transcriptional calls.
+
+Both RNA repos score interactions with the same formula used here, at `padj_interaction <= 0.1`.
+
+## Matching SIG16 ATAC to SIG13 RNA
+
+Three things have to be reconciled:
+
+1. **Ligand naming** — TGFb is `TGFB1` in SIG13.
+2. **Pair orientation** — SIG13 delivers the two guides in two rounds and scores each order
+   separately, so `IL4_TNF` and `TNF_IL4` are *different rows with their own classes*. Both are
+   kept (`..._ligand1_first`, `..._TNF_first`) and reconciled by **taking the orientation that
+   shows an effect**: a real class beats `none`, `none` beats `NA`, and ties go to the smaller
+   interaction FDR. `rna_orientation_used` records which one supplied the call. This is what makes
+   the TGFB1 arm usable — `TNF_TGFB1` is essentially inert (1 `synergy positive` gene vs 104 for
+   `TGFB1_TNF`), so the informative orientation is the one that gets used.
+3. **Gene identity** — the join key is the ChIPseeker nearest gene (`geneSymbol`, blanked beyond
+   50 kb from a TSS) against SIG13's `name`. Genes SIG13 never tested — its `0.05filter` keeps
+   only ~8.8k expressed genes — come back `NA`, which is *not* the same as an RNA `none`.
+
+A peak-to-gene join is many-to-one in both directions: one gene can carry several peaks, and one
+peak is assigned to exactly one nearest gene. Treat a match as "this peak lies near a gene whose
+transcript shows the same interaction", not as a validated regulatory link.
+
+```{r}
+SIG13_SCORED <- file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi",
+                          "interactions_scored_v3_glmGamPoi_0.05filter.csv")
+
+# SIG13 ligand names for the SIG16 ligand1s
+rna_ligand <- c(TGFb = "TGFB1", IL6 = "IL6", IL4 = "IL4")
+
+rna_pairs <- tibble(
+  ligand1     = rep(names(rna_ligand), each = 2),
+  orientation = rep(c("ligand1_first", "TNF_first"), times = length(rna_ligand)),
+  interaction = c(rbind(paste0(rna_ligand, "_", ligand2),
+                        paste0(ligand2, "_", rna_ligand))))
+
+# 2 = a real interaction call, 1 = tested but additive, 0 = not tested
+informativeness <- function(x) dplyr::case_when(is.na(x) ~ 0L, x == "none" ~ 1L, TRUE ~ 2L)
+
+rna <- fread(SIG13_SCORED,
+             select = c("name", "interaction", "lfc_condition", "adj_pval_condition",
+                        "lfc_interaction", "adj_pval_interaction",
+                        "interaction_score", "interaction_class"))
+rna <- rna[interaction %in% rna_pairs$interaction]
+
+rna_wide <- as_tibble(rna) %>%
+  left_join(rna_pairs, by = "interaction") %>%
+  dplyr::select(ligand1, geneSymbol = name, orientation,
+                rna_class = interaction_class, rna_score = interaction_score,
+                rna_padj_int = adj_pval_interaction, rna_lfc_condition = lfc_condition) %>%
+  pivot_wider(names_from = orientation,
+              values_from = c(rna_class, rna_score, rna_padj_int, rna_lfc_condition)) %>%
+  mutate(
+    # rank each orientation by how much it has to say: a real class (2) beats `none` (1),
+    # which beats an untested `NA` (0). Ties go to the smaller interaction FDR.
+    .rank_first = informativeness(rna_class_ligand1_first),
+    .rank_tnf   = informativeness(rna_class_TNF_first),
+    .keep_first = .rank_first > .rank_tnf |
+                  (.rank_first == .rank_tnf &
+                   coalesce(rna_padj_int_ligand1_first, Inf) <=
+                   coalesce(rna_padj_int_TNF_first, Inf)),
+    rna_orientation_used = dplyr::case_when(
+      .rank_first == 0 & .rank_tnf == 0 ~ NA_character_,
+      .keep_first ~ "ligand1_first",
+      TRUE ~ "TNF_first"),
+    rna_interaction_class = if_else(.keep_first, rna_class_ligand1_first, rna_class_TNF_first),
+    rna_interaction_score = if_else(.keep_first, rna_score_ligand1_first, rna_score_TNF_first),
+    rna_adj_pval_interaction = if_else(.keep_first, rna_padj_int_ligand1_first,
+                                       rna_padj_int_TNF_first),
+    rna_lfc_condition = if_else(.keep_first, rna_lfc_condition_ligand1_first,
+                                rna_lfc_condition_TNF_first)) %>%
+  dplyr::select(-starts_with("rna_score_"), -starts_with("rna_padj_int_"),
+                -starts_with("rna_lfc_condition_"), -.keep_first, -.rank_first, -.rank_tnf)
+
+cat("SIG13 genes available for the three pairs: ", n_distinct(rna_wide$geneSymbol), "\n", sep = "")
+```
+
+## Matching SIG16 ATAC to SIG18
+
+SIG18 scores five arms against TNF: `TGFb`, `Th1`, `Th2`, `Th17` and `iTreg`. Two are used here:
+
+- `TGFb` -> **TGFb**, a like-for-like counterpart of the SIG16 ligand.
+- `Th2` -> **IL4**, a *surrogate*: Th2 is an IL4-polarized subset rather than an acute IL4 pulse on
+  naive cells, so the match is on the driving cytokine, not on the cell state.
+
+`IL6` is still left **unmatched** — the nearest arm, `Th17`, is driven by TGFb + IL6 and so
+confounds the two SIG16 ligands. Edit `sig18_match` below to change any of this.
+
+All five arms are attached as `sig18_class_*` reference columns regardless, so the unused arms are
+one column lookup away.
+
+Unlike SIG13, SIG18 has no `NA` class: every gene it tested gets a call, so `none` means
+"tested, no interaction" and `NA` means the gene is absent from SIG18 (or the peak has no symbol).
+
+```{r}
+SIG18_SCORED <- file.path(imports_dir, "SIG18/analysis_outs/deg",
+                          "res_interaction_scored_SIG18.csv")
+
+# SIG16 ligand1 -> SIG18 condition; NA means "no equivalent perturbation in SIG18"
+# IL4 <- Th2 is a surrogate (polarized subset, not an acute IL4 pulse); IL6 has no clean arm
+sig18_match <- tibble(ligand1         = c("TGFb", "IL6", "IL4"),
+                      sig18_condition = c("TGFb", NA,    "Th2"))
+
+sig18 <- fread(SIG18_SCORED,
+               select = c("gene", "ligand1", "lfc_interaction", "padj_interaction",
+                          "lfc_total", "interaction_score", "interaction_class")) %>%
+  as_tibble() %>%
+  dplyr::rename(geneSymbol = gene, sig18_condition = ligand1)
+
+stopifnot(!any(duplicated(sig18[, c("geneSymbol", "sig18_condition")])))
+
+# every SIG18 arm as its own class column, for ad-hoc comparisons
+sig18_wide <- sig18 %>%
+  dplyr::select(geneSymbol, sig18_condition, interaction_class) %>%
+  pivot_wider(names_from = sig18_condition, values_from = interaction_class,
+              names_prefix = "sig18_class_")
+
+# the matched arm's full numbers, keyed by the SIG16 ligand1
+sig18_matched <- sig18_match %>%
+  filter(!is.na(sig18_condition)) %>%
+  left_join(sig18, by = "sig18_condition") %>%
+  dplyr::select(ligand1, geneSymbol,
+                sig18_interaction_class = interaction_class,
+                sig18_interaction_score = interaction_score,
+                sig18_padj_interaction  = padj_interaction,
+                sig18_lfc_total         = lfc_total)
+
+cat("SIG18 genes: ", n_distinct(sig18$geneSymbol),
+    " | matched arms: ", paste(na.omit(sig18_match$sig18_condition), collapse = ", "), "\n", sep = "")
+```
+
+```{r}
+interScored <- imap_dfr(scored, ~ mutate(.x, ligand1 = .y, .after = name)) %>%
+  # peaks >50 kb from a TSS carry no symbol and cannot be joined
+  left_join(rna_wide,     by = c("ligand1", "geneSymbol")) %>%
+  left_join(sig18_wide,   by = "geneSymbol") %>%
+  left_join(sig18_matched, by = c("ligand1", "geneSymbol")) %>%
+  mutate(
+    .atac_sp  = !is.na(interaction_class)       & interaction_class       == "synergy positive",
+    .sig13_sp = !is.na(rna_interaction_class)   & rna_interaction_class   == "synergy positive",
+    .sig18_sp = !is.na(sig18_interaction_class) & sig18_interaction_class == "synergy positive",
+    synergy_positive_both       = .atac_sp & .sig13_sp,   # ATAC + SIG13, as before
+    synergy_positive_atac_sig18 = .atac_sp & .sig18_sp,
+    synergy_positive_all3       = .atac_sp & .sig13_sp & .sig18_sp) %>%
+  dplyr::select(-.atac_sp, -.sig13_sp, -.sig18_sp)
+
+cat(nrow(interScored), " peak x pair rows; ",
+    sum(!is.na(interScored$rna_interaction_class)),   " carry a SIG13 call; ",
+    sum(!is.na(interScored$sig18_interaction_class)), " carry a matched SIG18 call\n", sep = "")
+```
+
+## ATAC vs RNA cross-tabulation
+
+These are lookups, not validation. SIG13 and SIG18 are **different systems sampled at different
+time points** — SIG13 an array perturbation screen read by scRNA, SIG18 bulk RNA of polarized
+subsets — so the two are not expected to agree with each other, and neither is expected to agree
+with chromatin. A peak whose nearest gene is called differently by an RNA assay is not evidence
+that either call is wrong. Use these tables to find candidates, not to arbitrate.
+
+Rows are peaks, not genes, so a gene with several peaks is counted several times. `not tested`
+means the gene is absent from that RNA repo — below SIG13's expression filter, or outside SIG18's
+gene set — or the peak has no gene within 50 kb. For SIG18 it additionally covers IL6, which has
+no matched arm.
+
+```{r}
+concordance <- function(col) {
+  interScored %>%
+    filter(!is.na(interaction_class)) %>%
+    mutate(other = fct_na_value_to_level(factor(.data[[col]], levels = class_levels),
+                                         "not tested")) %>%
+    count(ATAC = interaction_class, other) %>%
+    pivot_wider(names_from = other, values_from = n, values_fill = 0)
+}
+```
+
+SIG13:
+
+```{r}
+concordance("rna_interaction_class")
+```
+
+SIG18 (matched arms: TGFb rows against `TGFb`, IL4 rows against `Th2`; IL6 has no counterpart):
+
+```{r}
+concordance("sig18_interaction_class")
+```
+
+Peaks called `synergy positive` by the ATAC and at least one RNA assay. Agreement with *one*
+assay is the realistic bar here; `all3` is a stricter subset, not a quality threshold:
+
+```{r}
+interScored %>%
+  filter(synergy_positive_both | synergy_positive_atac_sig18) %>%
+  arrange(desc(synergy_positive_all3), ligand1, desc(abs(interaction_score))) %>%
+  dplyr::select(ligand1, geneSymbol, name, distanceToTSS,
+                atac_score = interaction_score,
+                sig13 = rna_interaction_class, sig13_score = rna_interaction_score,
+                sig13_orientation = rna_orientation_used,
+                sig18 = sig18_interaction_class, sig18_score = sig18_interaction_score,
+                all3 = synergy_positive_all3) %>%
+  mutate(across(where(is.numeric), ~ signif(.x, 3)))
+```
+
+## Export
+
+Written next to the DESeq2 results rather than to `analysis_outs/`, because
+`analysis_outs/interScored_SIG16_ATAC.csv` is the **archived nf-core-consensus-atlas** table with
+`Interval_NNNNN` peak IDs — a different atlas that must not be overwritten or joined to these.
+
+```{r}
+write.csv(interScored,
+          file.path(OUT_DIR, "interScored_SIG16_ATAC_idr-0.05.csv"), row.names = FALSE)
+write.csv(subset(interScored, !is.na(interaction_class)),
+          file.path(OUT_DIR, "interScored_SIG16_ATAC_idr-0.05_sig.csv"), row.names = FALSE)
+```

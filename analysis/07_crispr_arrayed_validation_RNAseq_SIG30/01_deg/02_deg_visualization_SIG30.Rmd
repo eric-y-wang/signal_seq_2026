@@ -1,0 +1,211 @@
+---
+title: "DEG Visualization SIG30"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+---
+
+Visualizes the DEG results from `01_deg_analysis_SIG30.Rmd`
+(stable copy read from `imports_stable/SIG30/analysis_outs/res_targets_SIG30.csv`): clustered sample-correlation
+heatmaps restricted to DEGs (built two ways — normalized-count expression and
+the z-scored-vs-control matrix from a SIG30 z-score processing step that is
+not in this repo; read from `imports_stable/SIG30/processing_outs/`),
+a knockdown-validation bar plot of each target gene's own expression across
+conditions, and a compact target-gene x KO-condition LFC heatmap annotated
+for significance.
+
+```{r setup}
+library(tidyverse)
+library(ggplot2)
+library(ggthemes)
+library(patchwork)
+library(RColorBrewer)
+library(pheatmap)
+library(tidyplots)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# Repo-relative paths: inputs from imports_stable/, outputs to analysis_outs/<module>/
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "07_crispr_arrayed_validation_RNAseq_SIG30")
+dir.create(outs_dir, recursive = TRUE, showWarnings = FALSE)
+source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
+theme_set(theme_Publication())
+```
+
+### [Import Data]{.underline}
+
+`norm_counts_matrix_SIG30.csv` (DESeq2 size-factor-normalized counts) and
+`zscore_matrix_SIG30.csv` (per-gene z-score vs. `control` mean/SD) are both
+produced by `processing/zscore_processing_SIG30.Rmd`, already indexed by
+gene symbol with `sample_ID`-matching column names — no need to rebuild a
+DESeq2 model here.
+
+```{r}
+metadata <- read_csv(file.path(imports_dir, "SIG30/processing_outs/processed_metadata_SIG30.csv"))
+
+norm_counts <- read.csv(file.path(imports_dir, "SIG30/processing_outs/norm_counts_matrix_SIG30.csv"), row.names = 1, check.names = FALSE)
+zscore      <- read.csv(file.path(imports_dir, "SIG30/processing_outs/zscore_matrix_SIG30.csv"), row.names = 1, check.names = FALSE)
+
+res_targets <- read_csv(file.path(imports_dir, "SIG30/analysis_outs/res_targets_SIG30.csv"))
+```
+
+```{r}
+# set metadata factors (control = reference level), mirroring deg_analysis_SIG30.Rmd
+metaDF <- metadata %>%
+  mutate(
+    replicate = factor(replicate),
+    target    = factor(target, levels = c("control", sort(setdiff(unique(target), "control"))))
+  ) %>%
+  as.data.frame()
+rownames(metaDF) <- metaDF$sample_ID
+
+norm_counts <- norm_counts[, rownames(metaDF)]
+zscore      <- zscore[, rownames(metaDF)]
+```
+
+### [DEG gene set]{.underline}
+
+Union of genes significant (padj < 0.01) vs. `control` in at least one
+target, used as the gene set for both correlation heatmaps below.
+
+```{r}
+finite_rows <- function(mat) rownames(mat)[apply(mat, 1, function(x) all(is.finite(x)))]
+
+deg_genes <- res_targets %>%
+  filter(padj < 0.01) %>%
+  distinct(gene) %>%
+  pull(gene) %>%
+  intersect(rownames(norm_counts)) %>%
+  # zscore is undefined (NA/Inf) for genes with zero control-group variance; drop those
+  intersect(finite_rows(zscore))
+
+length(deg_genes)
+```
+
+```{r}
+mk_pal <- function(n) colorRampPalette(tableau_color_pal("Tableau 10")(10))(n)
+target_colors <- setNames(mk_pal(nlevels(metaDF$target)), levels(metaDF$target))
+ann_col <- data.frame(target = metaDF$target, row.names = rownames(metaDF))
+ann_colors <- list(target = target_colors)
+```
+
+### [Sample correlation heatmap: normalized-count expression of DEGs]{.underline}
+
+Pearson correlation between samples computed on log2(normalized count + 1),
+restricted to the DEG gene set; hierarchically clustered, with a `target`
+color bar.
+
+```{r, fig.width=11, fig.height=10}
+expr_deg <- log2(norm_counts[deg_genes, ] + 1)
+cor_expr <- cor(expr_deg, method = "pearson")
+
+pheatmap(cor_expr,
+         color = colorRampPalette(rev(brewer.pal(11, "RdBu")))(100),
+         annotation_row = ann_col,
+         annotation_colors = ann_colors,
+         main = paste0("Sample correlation (log2 norm counts, ", length(deg_genes), " DEGs)"))
+```
+
+### [Sample correlation heatmap: z-scored (pseudo-LFC) DEGs]{.underline}
+
+Pearson correlation between samples computed on the `zscore_matrix_SIG30.csv`
+values (each gene z-scored against the `control` mean/SD), restricted to the
+DEG gene set. This asks whether samples share a *deviation-from-control
+pattern* rather than raw expression level.
+
+```{r, fig.width=11, fig.height=10}
+lfc_deg <- zscore[deg_genes, ]
+cor_lfc <- cor(lfc_deg, method = "pearson")
+
+pheatmap(cor_lfc,
+         color = colorRampPalette(rev(brewer.pal(11, "RdBu")))(100),
+         annotation_row = ann_col,
+         annotation_colors = ann_colors,
+         main = paste0("Sample correlation (z-score vs control, ", length(deg_genes), " DEGs)"))
+```
+
+### [Target-gene knockdown validation: expression bar plot]{.underline}
+
+For each CRISPR target gene, its own normalized-count expression across
+every KO condition (+ `control`); the matching KO condition (highlighted)
+should show reduced expression if the knockout was effective.
+
+```{r}
+target_genes <- levels(metaDF$target) %>% setdiff("control")
+
+gene_expr <- norm_counts[rownames(norm_counts) %in% target_genes, , drop = FALSE] %>%
+  rownames_to_column("gene") %>%
+  pivot_longer(-gene, names_to = "sample_ID", values_to = "expr") %>%
+  left_join(metaDF %>% dplyr::select(sample_ID, target), by = "sample_ID") %>%
+  mutate(target = as.character(target)) %>%
+  filter(target == gene | target == "control") %>%
+  mutate(is_self = target == gene)
+```
+
+```{r, fig.width=16, fig.height=4}
+plot_list <- gene_expr %>%
+  split(.$gene) %>%
+  imap(function(df, gene_name) {
+    df %>%
+      mutate(target = factor(target, levels = c("control", gene_name))) %>%
+      ggplot(aes(x = target, y = expr)) +
+      stat_summary(aes(fill = is_self), fun = mean, geom = "col") +
+      geom_jitter(width = 0.15, size = 1, alpha = 0.6) +
+      scale_fill_manual(values = c(`TRUE` = "#C44E52", `FALSE` = "grey70"), guide = "none") +
+      theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+      labs(x = NULL, y = "normalized count", title = gene_name) +
+      scale_y_continuous(expand = expansion(mult = c(0, 0.05)), limits = c(0, NA))
+  })
+
+wrap_plots(plot_list, ncol = 9) +
+  plot_annotation(title = "Target-gene expression across conditions (knockdown validation)")
+
+ggsave(file.path(outs_dir, "target_lfc_barplots_SIG30.pdf"))
+```
+
+### [Target-gene x KO-condition LFC heatmap]{.underline}
+
+Compact validation matrix: rows are the CRISPR target genes' own transcripts,
+columns are the KO conditions (vs. `control`), colored by `log2FoldChange`
+from `res_targets_SIG30.csv` and annotated with significance stars
+(`*` padj < 0.05, `**` padj < 0.01, `***` padj < 0.001). The diagonal is the
+on-target knockdown effect; off-diagonal cells reveal cross-target/
+co-regulatory effects (e.g. `Stat5a` KO affecting `Stat5b` expression).
+
+```{r, fig.width=8, fig.height=4}
+target_lfc <- res_targets %>%
+  filter(gene %in% target_genes, target %in% target_genes) %>%
+  mutate(
+    gene   = factor(gene, levels = target_genes),
+    target = factor(target, levels = target_genes),
+    sig = case_when(
+      padj < 0.001 ~ "***",
+      padj < 0.01  ~ "**",
+      padj < 0.05  ~ "*",
+      TRUE         ~ ""
+    )
+  )
+
+target_lfc %>%
+  ggplot(aes(x = target, y = gene, fill = log2FoldChange)) +
+  geom_tile() +
+  geom_text(aes(label = sig), size = 5, vjust = 0.7) +
+  scale_fill_distiller(palette = "RdBu", limits = c(-1, 1) * max(abs(target_lfc$log2FoldChange))) +
+  labs(x = "CRISPR target (KO condition)", y = "target gene (own transcript)",
+       fill = "log2FC\nvs control",
+       title = "On-target knockdown effect and cross-target effects")
+
+ggsave(file.path(outs_dir, "target_lfc_heatmap_SIG30.pdf"))
+```
+
+

@@ -1,0 +1,325 @@
+---
+title: "SIG13 Interaction Visualization"
+author: "Ian Zumpano"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+## Load packages:
+
+```{r message=FALSE, warning=FALSE}
+# install.packages("BiocManager")
+
+library(circlize)
+library(tidyverse)
+library(dplyr)
+library(ComplexHeatmap)
+```
+
+# Circlize Diagram of Interaction Counts:
+
+The goal for the circlize diagram is to have the outer groups be ligands and each of the bridges between them be the number of significant interactions for the ligand pair (padj < 0.1). for each distinct ligand pair, count the number of significant interactions. (for ligand pairs that have 2 combinations for each distinct pair, take the average number of interactions.)
+
+## Load Data
+
+```{r}
+# Repo-relative paths: inputs from imports_stable/, outputs to analysis_outs/
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "02_combinatorial_screen_signalseq_SIG13")
+data <- read.csv(file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/interactions_scored_v3_glmGamPoi_0.05filter_sig.csv"))
+
+# inter-replicate correlations
+conditionLfcRep <- readr::read_csv(file.path(imports_dir, "SIG13/analysis_outs/replicate_corr/replicate_correlation_singleLfc_0.2filter.csv"))
+interLfcRep <- readr::read_csv(file.path(imports_dir, "SIG13/analysis_outs/replicate_corr/replicate_correlation_interactionLfc_0.2filter.csv"))
+
+singleLfc <- readr::read_csv(file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/glmGamPoi_single_term/glmGamPoi_singleTerm_lfc_0.05filter.csv"))
+```
+
+## Filter for consistent conditions
+
+```{r}
+# define consistent ligands by pearson correlation of LFCs
+consistentLigands <- conditionLfcRep %>%
+  filter(pearson_corr > 0.5) %>%
+  pull(condition)
+
+inconsistentInteractions <- interLfcRep %>%
+  filter(pearson_corr <= 0.25) %>%
+  pull(interaction)
+
+data <- data %>%
+  filter(interaction %in% consistentLigands) %>%
+  filter(!interaction %in% inconsistentInteractions)
+```
+
+## Filter for significant interactions, remove self interactions (eg IL2_IL2), and create sorted ligand column
+
+```{r}
+# Start with padj of 0.1
+sig_data <- data %>% filter(adj_pval_interaction < 0.01)
+```
+
+
+```{r}
+# Remove self_self interactions 
+sig_data <- sig_data %>%
+  separate(interaction, into = c("lig1_temp", "lig2_temp"), sep = "_", remove = FALSE) %>%
+  filter(lig1_temp != lig2_temp) %>%
+  select(-lig1_temp, -lig2_temp)
+```
+
+
+```{r}
+sig_data <- sig_data %>% mutate(
+    parts = str_split(interaction, "_"),
+    # alphabetically sort each pair
+    interaction_sorted = sapply(parts, function(x) paste(sort(x), collapse = "_"))
+  )
+```
+
+
+## Separate data by interaction class and create individual plots
+
+```{r}
+get_avg_num_int_for_class <- function(df = sig_data, int_class_str){
+  class_sig_data <- df %>% filter(str_detect(interaction_class, int_class_str))
+  
+  num_interactions <- class_sig_data %>% group_by(interaction) %>% summarise(n_interactions = n()) %>% arrange(desc(n_interactions))
+
+  num_interactions <- num_interactions %>% mutate(
+    interaction_sorted = sapply(str_split(interaction, "_"), function(x) paste(sort(x), collapse = "_")))
+  
+  final_interactions <- num_interactions %>%
+    group_by(interaction_sorted) %>%
+    summarise(interaction = if (n() > 1) first(interaction_sorted) else first(interaction),
+      n_interactions = mean(n_interactions), .groups = "drop") %>% 
+    arrange(desc(n_interactions))
+  
+  final_interactions <- final_interactions %>% separate(interaction, into = c("lig1", "lig2"), sep = "_", remove = FALSE) %>% select(-interaction_sorted)
+  
+  return(final_interactions)
+}
+```
+
+```{r}
+get_adj_mtx <- function(n_avg_interactions){
+  ligands <- sort(unique(c(n_avg_interactions$lig1, n_avg_interactions$lig2)))
+  
+  # Create an empty adjacency matrix (ligand × ligand)
+  mat <- matrix(0, nrow = length(ligands), ncol = length(ligands),
+                dimnames = list(ligands, ligands))
+  
+  # Fill the matrix with values
+  for(i in seq_len(nrow(n_avg_interactions))) {
+      l1 <- n_avg_interactions$lig1[i]
+      l2 <- n_avg_interactions$lig2[i]
+      val <- n_avg_interactions$n_interactions[i]
+      
+      mat[l1, l2] <- val
+      mat[l2, l1] <- val    # symmetric (undirected)
+  }
+  # keep only upper triangle (including diagonal) so that interactions are not counted twice
+  mat_upper <- mat
+  mat_upper[lower.tri(mat_upper)] <- 0
+  
+  return(mat_upper)
+}
+```
+
+```{r}
+# consistent sector colors per ligand across all chord diagrams
+all_ligands <- sort(unique(unlist(str_split(sig_data$interaction, "_"))))
+grid_cols <- setNames(scales::hue_pal()(length(all_ligands)), all_ligands)
+```
+
+
+# Buffering Interactions (buffering and buffering complete)
+
+```{r}
+buffering_int <- get_avg_num_int_for_class(int_class_str = "buffering")
+```
+
+```{r}
+buffering_mat <- get_adj_mtx(n_avg_interactions = buffering_int)
+```
+
+```{r, fig.height=8, fig.width=8}
+# 1. Clear previous parameters
+circos.clear()
+
+# --- PREPARE LINK COLORS ---
+# Calculate the range of values in your matrix (ignoring zeros)
+min_val <- min(buffering_mat[buffering_mat > 0], na.rm = TRUE)
+max_val <- max(buffering_mat, na.rm = TRUE)
+
+# Create a color mapping function: Value -> Color
+# We create 50 breaks across the range and map them to the Viridis palette
+col_fun <- colorRamp2(
+  breaks = seq(min_val, max_val, length.out = 50), 
+  colors = viridisLite::viridis(50)
+)
+# ---------------------------
+
+# 2. Set global parameters
+circos.par(start.degree = 90, gap.after = 2)
+
+# 3. Create the Chord Diagram
+chordDiagram(
+  buffering_mat,
+  transparency = 0.3,
+  annotationTrack = "grid", 
+  preAllocateTracks = list(track.height = 0.3),
+  grid.col = grid_cols,
+  col = col_fun  # <--- Apply the value-based color mapping here
+)
+
+# 4. Manually add the perpendicular labels
+circos.track(track.index = 1, panel.fun = function(x, y) {
+  circos.text(
+    CELL_META$xcenter, 
+    CELL_META$ylim[1], 
+    CELL_META$sector.index, 
+    facing = "clockwise", 
+    niceFacing = TRUE, 
+    adj = c(0, 0.5), 
+    cex = 0.8
+  )
+}, bg.border = NA)
+
+# Optional: Add a legend for the link colors
+lgd_links <- Legend(col_fun = col_fun, title = "Link Strength")
+draw(lgd_links, x = unit(1, "cm"), y = unit(1, "cm"), just = c("left", "bottom"))
+```
+
+# Synergy Positive Interactions
+
+```{r}
+positive_int <- get_avg_num_int_for_class(int_class_str = "synergy positive")
+```
+
+```{r}
+positive_mat <- get_adj_mtx(n_avg_interactions = positive_int)
+```
+
+```{r, fig.height=10, fig.width=10}
+# 1. Clear previous parameters
+circos.clear()
+
+# --- PREPARE LINK COLORS ---
+# Calculate the range of values in your matrix (ignoring zeros)
+min_val <- min(positive_mat[positive_mat > 0], na.rm = TRUE)
+max_val <- max(positive_mat, na.rm = TRUE)
+
+# Create a color mapping function: Value -> Color
+# We create 50 breaks across the range and map them to the Viridis palette
+col_fun <- colorRamp2(
+  breaks = seq(min_val, max_val, length.out = 50), 
+  colors = viridisLite::viridis(50)
+)
+# ---------------------------
+
+# 2. Set global parameters
+circos.par(start.degree = 90, gap.after = 2)
+
+# 3. Create the Chord Diagram
+chordDiagram(
+  positive_mat,
+  transparency = 0.3,
+  annotationTrack = "grid", 
+  preAllocateTracks = list(track.height = 0.3),
+  grid.col = grid_cols,
+  col = col_fun  # <--- Apply the value-based color mapping here
+)
+
+# 4. Manually add the perpendicular labels
+circos.track(track.index = 1, panel.fun = function(x, y) {
+  circos.text(
+    CELL_META$xcenter, 
+    CELL_META$ylim[1], 
+    CELL_META$sector.index, 
+    facing = "clockwise", 
+    niceFacing = TRUE, 
+    adj = c(0, 0.5), 
+    cex = 0.8
+  )
+}, bg.border = NA)
+
+# Optional: Add a legend for the link colors
+library(ComplexHeatmap)
+lgd_links <- Legend(col_fun = col_fun, title = "Link Strength")
+draw(lgd_links, x = unit(1, "cm"), y = unit(1, "cm"), just = c("left", "bottom"))
+```
+
+# Synergy Negative Interactions
+
+```{r}
+negative_int <- get_avg_num_int_for_class(int_class_str = "synergy negative")
+```
+
+```{r}
+negative_mat <- get_adj_mtx(n_avg_interactions = negative_int)
+```
+
+```{r, fig.height=12, fig.width=12}
+# 1. Clear previous parameters
+circos.clear()
+
+# --- PREPARE LINK COLORS ---
+# Calculate the range of values in your matrix (ignoring zeros)
+min_val <- min(negative_mat[negative_mat > 0], na.rm = TRUE)
+max_val <- max(negative_mat, na.rm = TRUE)
+
+# Create a color mapping function: Value -> Color
+# We create 50 breaks across the range and map them to the Viridis palette
+col_fun <- colorRamp2(
+  breaks = seq(min_val, max_val, length.out = 50), 
+  colors = viridisLite::viridis(50)
+)
+# ---------------------------
+
+# 2. Set global parameters
+circos.par(start.degree = 90, gap.after = 2)
+
+# 3. Create the Chord Diagram
+chordDiagram(
+  negative_mat,
+  transparency = 0.3,
+  annotationTrack = "grid", 
+  preAllocateTracks = list(track.height = 0.3),
+  grid.col = grid_cols,
+  col = col_fun  # <--- Apply the value-based color mapping here
+)
+
+# 4. Manually add the perpendicular labels
+circos.track(track.index = 1, panel.fun = function(x, y) {
+  circos.text(
+    CELL_META$xcenter, 
+    CELL_META$ylim[1], 
+    CELL_META$sector.index, 
+    facing = "clockwise", 
+    niceFacing = TRUE, 
+    adj = c(0, 0.5), 
+    cex = 0.8
+  )
+}, bg.border = NA)
+
+# Optional: Add a legend for the link colors
+library(ComplexHeatmap)
+lgd_links <- Legend(col_fun = col_fun, title = "Link Strength")
+draw(lgd_links, x = unit(1, "cm"), y = unit(1, "cm"), just = c("left", "bottom"))
+```
+
+

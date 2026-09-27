@@ -1,0 +1,231 @@
+---
+title: "glm_coefficient_concordance_cutoffs"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup}
+library(tidyverse)
+library(patchwork)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Repo-relative paths: inputs are read from imports_stable/, outputs are written to analysis_outs/
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find the repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "02_combinatorial_screen_signalseq_SIG13")
+source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
+theme_set(theme_Publication())
+
+plot_dir <- file.path(outs_dir, "plots/qc_barcode_cutoff")
+out_dir <- file.path(outs_dir, "qc_barcode_cutoff")
+# cutoff dataset summaries written by 03_generate_cutoff_datasets.ipynb
+in_dir <- file.path(imports_dir, "SIG13/analysis_outs/qc_barcode_cutoff")
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+cutoffs <- 1:10
+ref_cutoff <- 7
+```
+
+# Import
+
+DSB7 is the cutoff fit used in the manuscript
+(`05_interaction_scoring/glmGamPoi_interaction_slurm.r`); the
+other cutoffs come from `04_glmGamPoi_interaction_cutoff_slurm.r`.
+
+```{r}
+glm_dir <- function(k) {
+  if (k == ref_cutoff) file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/glmGamPoi_interaction")
+  else file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi", paste0("glmGamPoi_interaction_DSB", k))
+}
+
+load_cutoff <- function(k) {
+  singles <- read_csv(file.path(glm_dir(k), "glmGamPoi_singles_lfc_0.1filter.csv"),
+                      show_col_types = FALSE) %>%
+    mutate(coef_type = if_else(str_ends(single_ligand, "_round1"), "ligand1", "ligand2"))
+  inter <- read_csv(file.path(glm_dir(k), "glmGamPoi_interaction_lfc_0.1filter.csv"),
+                    show_col_types = FALSE) %>%
+    mutate(coef_type = "interaction")
+
+  bind_rows(singles %>% select(interaction, name, coef_type, lfc, adj_pval),
+            inter %>% select(interaction, name, coef_type, lfc, adj_pval)) %>%
+    mutate(cutoff = k)
+}
+
+lfc <- map(cutoffs, load_cutoff) %>% list_rbind()
+lfc %>% count(cutoff, coef_type)
+```
+
+```{r}
+cell_counts <- read_csv(file.path(in_dir, "cutoff_dataset_summary.csv"), show_col_types = FALSE)
+cell_counts
+```
+
+# Define Consistent Ligands
+
+We first filter for consistent ligands as defined in the manuscript.
+
+```{r}
+repCor <- read_csv(file.path(imports_dir, "SIG13/analysis_outs/replicate_corr/replicate_correlation_interactionLfc_0.2filter.csv"),
+                   show_col_types = FALSE)
+
+consistent_ligands <- repCor %>%
+  filter(pearson_corr > 0.25 & num_shared_genes > 1) %>%
+  pull(interaction)
+
+length(consistent_ligands)
+```
+
+Conditions are identical across DSB1-9, but DSB10 loses a couple to the
+10-cell filter, so combos are also restricted to those present at every
+cutoff (written by notebook 3).
+
+```{r}
+common_conditions <- read_csv(file.path(in_dir, "cutoff_common_conditions.csv"),
+                              show_col_types = FALSE) %>% pull(ligand_call)
+
+lfc <- lfc %>%
+  filter(interaction %in% consistent_ligands, interaction %in% common_conditions)
+
+n_distinct(lfc$interaction)
+```
+
+# Calculate Concordance
+
+For each ligand combo and coefficient type, correlate per-gene LFCs
+between two cutoffs, keeping genes significant in either. The two
+single-ligand terms are correlated separately and reported together as
+`single`, so each combo contributes two `single` points and one
+`interaction` point.
+
+```{r}
+concordance <- function(k_a, k_b) {
+  inner_join(
+    lfc %>% filter(cutoff == k_a) %>% select(interaction, name, coef_type, lfc_a = lfc, padj_a = adj_pval),
+    lfc %>% filter(cutoff == k_b) %>% select(interaction, name, coef_type, lfc_b = lfc, padj_b = adj_pval),
+    by = c("interaction", "name", "coef_type")
+  ) %>%
+    drop_na(lfc_a, lfc_b) %>%
+    filter(padj_a < 0.1 | padj_b < 0.1) %>%
+    group_by(interaction, coef_type) %>%
+    filter(n() > 2) %>%
+    summarise(
+      pearson_corr = cor(lfc_a, lfc_b, method = "pearson"),
+      n_genes = n(),
+      .groups = "drop"
+    ) %>%
+    # ligand1 and ligand2 are correlated separately - pooling their genes would mix two
+    # coefficients into one Pearson - then reported together as "single"
+    mutate(coef_type = if_else(coef_type == "interaction", "interaction", "single"),
+           cutoff_a = k_a, cutoff_b = k_b)
+}
+```
+
+```{r}
+vs_ref <- map(setdiff(cutoffs, ref_cutoff), ~ concordance(.x, ref_cutoff)) %>%
+  list_rbind() %>%
+  mutate(cutoff = factor(cutoff_a, levels = cutoffs))
+
+write_csv(vs_ref, file.path(out_dir, "glm_coefficient_concordance_cutoffs.csv"))
+vs_ref
+```
+
+```{r}
+pairs <- combn(cutoffs, 2, simplify = FALSE)
+pairwise <- map(pairs, ~ concordance(.x[1], .x[2])) %>% list_rbind()
+write_csv(pairwise, file.path(out_dir, "glm_coefficient_concordance_pairwise.csv"))
+```
+
+# Plots
+
+```{r, fig.width=10, fig.height=4}
+p_box <- vs_ref %>%
+  ggplot(aes(x = cutoff, y = pearson_corr, color = cutoff)) +
+  geom_boxplot(width = 0.6, outlier.size = 0.5) +
+  ylim(0, 1) +
+  facet_wrap(~coef_type) +
+  theme(aspect.ratio = 1) +
+  scale_color_viridis_d(option = "turbo", end = 0.9) +
+  labs(x = "DSB cutoff", y = "Pearson r\n(vs. DSB7)",
+       title = sprintf("Reproducible combos only (n=%d)", n_distinct(vs_ref$interaction)))
+
+p_box
+ggsave(file.path(plot_dir, "glm_coefficient_concordance_cutoffs.pdf"), p_box)
+```
+
+```{r, fig.width=16, fig.height=6}
+heat_df <- pairwise %>%
+  group_by(coef_type, cutoff_a, cutoff_b) %>%
+  summarise(median_corr = median(pearson_corr, na.rm = TRUE), .groups = "drop")
+
+heat_df <- bind_rows(
+  heat_df,
+  heat_df %>% rename(cutoff_a = cutoff_b, cutoff_b = cutoff_a),
+  expand_grid(coef_type = unique(heat_df$coef_type), cutoff_a = cutoffs) %>%
+    mutate(cutoff_b = cutoff_a, median_corr = 1)
+)
+
+p_heat <- heat_df %>%
+  ggplot(aes(x = factor(cutoff_a), y = factor(cutoff_b), fill = median_corr)) +
+  geom_tile() +
+  geom_text(aes(label = sprintf("%.2f", median_corr)), size = 2.5) +
+  scale_fill_viridis_c(limits = c(0, 1)) +
+  facet_wrap(~coef_type) +
+  theme(aspect.ratio = 1) +
+  labs(x = "DSB cutoff", y = "DSB cutoff", fill = "median r",
+       title = "Median per-combo LFC correlation between cutoffs")
+
+p_heat
+ggsave(file.path(plot_dir, "glm_coefficient_concordance_pairwise_heatmap.pdf"), p_heat)
+```
+
+Cutoffs differ in cell number as well as cell identity, so concordance
+is also plotted against the size of each cutoff's dataset.
+
+```{r, fig.width=10, fig.height=4}
+p_n <- vs_ref %>%
+  left_join(cell_counts %>% select(cutoff_a = cutoff, n_cells), by = "cutoff_a") %>%
+  group_by(cutoff, coef_type, n_cells) %>%
+  summarise(median_corr = median(pearson_corr, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(x = n_cells, y = median_corr, color = cutoff)) +
+  geom_point(size = 2) +
+  facet_wrap(~coef_type) +
+  theme(aspect.ratio = 1) +
+  scale_color_viridis_d(option = "turbo", end = 0.9) +
+  labs(x = "n cells in cutoff dataset", y = "median Pearson r (vs. DSB7)")
+
+p_n
+ggsave(file.path(plot_dir, "glm_concordance_vs_dataset_size.pdf"), p_n)
+```
+
+# Summary
+
+```{r}
+vs_ref %>%
+  group_by(coef_type, cutoff) %>%
+  summarise(median_corr = median(pearson_corr, na.rm = TRUE),
+            mean_corr = mean(pearson_corr, na.rm = TRUE),
+            n_combos = n(),
+            .groups = "drop") %>%
+  arrange(coef_type, cutoff)
+```
+
+```{r}
+model <- aov(pearson_corr ~ cutoff, data = vs_ref %>% filter(coef_type == "interaction"))
+TukeyHSD(model)
+```

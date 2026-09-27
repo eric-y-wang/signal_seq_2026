@@ -1,0 +1,360 @@
+---
+title: "TGFb + TNF Family Interaction Specificity"
+author: "EYW"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup}
+library(tidyverse)
+library(patchwork)
+library(viridisLite)
+library(ggrepel)
+library(RColorBrewer)
+library(scales)
+library(data.table)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Repo-relative paths: inputs from imports_stable/, outputs to analysis_outs/
+repo_dir <- (function(d = normalizePath(getwd())) {
+  while (!dir.exists(file.path(d, "imports_stable"))) {
+    if (dirname(d) == d) stop("Could not find repo root (folder containing imports_stable/)")
+    d <- dirname(d)
+  }
+  d
+})()
+imports_dir <- file.path(repo_dir, "imports_stable")
+outs_dir <- file.path(repo_dir, "analysis_outs", "02_combinatorial_screen_signalseq_SIG13")
+dir.create(file.path(outs_dir, "plots"), showWarnings = FALSE, recursive = TRUE)
+source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
+theme_set(theme_Publication())
+
+tab10_colors <- c("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+                  "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf")
+
+interaction_palette <- c("#808080","#D95F02","#E7298A","#1B9E77FF")
+names(interaction_palette) <- c("none","buffering","synergy negative","synergy positive")
+
+# classes we test for uniqueness
+CLASSES <- c("synergy positive","synergy negative","buffering")
+
+out_dir <- file.path(outs_dir, "tgfb_tnf")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+# Goal
+
+Assess how unique the positive synergy genes of the **TGFB1 x TNF-family** interactions are
+relative to other TGFB1 interactions and other TNF-family interactions.
+
+# Import
+
+```{r}
+interScored <- data.table::fread(
+    file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/interactions_scored_v3_glmGamPoi_0.05filter.csv"),
+    select = c("name","interaction","lfc_condition","adj_pval_condition",
+               "lfc_ligand1","lfc_ligand2","lfc_interaction","adj_pval_interaction",
+               "interaction_class")
+  ) %>%
+  as_tibble() %>%
+  mutate(interaction_class = case_when(interaction_class == "additive over saturation" ~ "none",
+                                       interaction_class == "buffering complete" ~ "buffering",
+                                       is.na(interaction_class) | interaction_class == "" ~ "none",
+                                       TRUE ~ interaction_class)) %>%
+  mutate(interaction_class = factor(interaction_class,
+                                    levels = c("none","buffering","synergy negative","synergy positive"))) %>%
+  mutate(lfc_expected = lfc_ligand1 + lfc_ligand2)
+
+# inter-replicate correlations
+conditionLfcRep <- readr::read_csv(file.path(imports_dir, "SIG13/analysis_outs/replicate_corr/replicate_correlation_singleLfc_0.2filter.csv"))
+interLfcRep <- readr::read_csv(file.path(imports_dir, "SIG13/analysis_outs/replicate_corr/replicate_correlation_interactionLfc_0.2filter.csv"))
+singleLfc <- readr::read_csv(file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/glmGamPoi_single_term/glmGamPoi_singleTerm_lfc_0.05filter.csv"))
+```
+
+# Filter and annotate data
+
+Same QC filters as `01`: consistent single-ligand conditions, drop poorly reproducible
+interaction terms, drop round-2 TGFB1 (inactive — recombinant TGFB1 was only added to round-1
+wells), and keep genes that are significant in the condition model (or buffering).
+
+```{r}
+# define consistent ligands by pearson correlation of LFCs
+consistentLigands <- conditionLfcRep %>%
+  filter(pearson_corr > 0.5) %>%
+  pull(condition)
+
+inconsistentInteractions <- interLfcRep %>%
+  filter(pearson_corr <= 0.25) %>%
+  pull(interaction)
+
+interScoredSig <- interScored %>%
+  filter(interaction %in% consistentLigands) %>%
+  filter(!interaction %in% inconsistentInteractions) %>%
+  # remove _TGFB1 ligands as it is not active
+  filter(!grepl("_TGFB1", interaction)) %>%
+  # remove genes that are not significant
+  filter(adj_pval_condition < 0.1 | interaction_class == "buffering")
+
+# conditions with an appreciable single-term DEG response
+combinations_with_effects <- singleLfc %>%
+  filter(adj_pval < 0.1) %>%
+  count(condition) %>%
+  filter(n > 50) %>%
+  pull(condition)
+```
+
+## Family assignment
+
+TGFb side is **TGFB1 in round 1 only**. TNFSF9 / TNFSF14 are dropped as non-performing, consistent with
+`01` and `interaction_focused_viz.Rmd`.
+
+```{r}
+TNF_FAMILY <- c("TNF","TNFSF4","TNFSF15","TNFSF18")
+
+interAnnot <- interScoredSig %>%
+  # TGFB3 / MSTN are not treated as TGFb here; TNFSF9/14 are non-performing
+  filter(!grepl("TGFB3|MSTN|TNFSF9|TNFSF14", interaction)) %>%
+  separate(interaction, into = c("lig1","lig2"), sep = "_", remove = FALSE) %>%
+  mutate(has_tgfb = lig1 == "TGFB1",
+         has_tnf = lig1 %in% TNF_FAMILY | lig2 %in% TNF_FAMILY,
+         has_linker = lig1 == "linker" | lig2 == "linker",
+         is_homotypic = lig1 == lig2) %>%
+  mutate(family_group = case_when(
+    has_linker | is_homotypic ~ "excluded",
+    has_tgfb & has_tnf ~ "TGFb x TNF",
+    has_tgfb & !has_tnf ~ "TGFb other",
+    has_tnf & !has_tgfb ~ "TNF other",
+    TRUE ~ "other"
+  )) %>%
+  mutate(family_group = factor(family_group,
+                               levels = c("TGFb x TNF","TGFb other","TNF other","other","excluded")))
+
+# condition sets
+focalConditions <- interAnnot %>%
+  filter(family_group == "TGFb x TNF") %>%
+  pull(interaction) %>% unique() %>% sort()
+
+tgfbOtherConditions <- interAnnot %>%
+  filter(family_group == "TGFb other") %>%
+  pull(interaction) %>% unique() %>% sort()
+
+tnfOtherConditions <- interAnnot %>%
+  filter(family_group == "TNF other") %>%
+  pull(interaction) %>% unique() %>% sort()
+
+backgroundConditions <- union(tgfbOtherConditions, tnfOtherConditions)
+
+focalConditions
+length(tgfbOtherConditions); length(tnfOtherConditions)
+```
+
+```{r}
+# focal conditions that also clear the >50 DEG bar (these get plotted)
+focalPlotConditions <- intersect(focalConditions, combinations_with_effects)
+focalPlotConditions
+
+setdiff(focalConditions, combinations_with_effects)
+```
+
+# Uniqueness of interaction hits
+
+A gene counts as **unique** to a condition for a given interaction class if it carries that
+class in the condition and does *not* carry that class in any of the background conditions.
+
+```{r}
+# long table of class hits, one row per gene x condition x class
+classHits <- interAnnot %>%
+  filter(interaction_class %in% CLASSES) %>%
+  distinct(interaction, family_group, interaction_class, name)
+
+#' Fraction of each class's hit genes that are unique to a focal condition.
+#'
+#' @param hits long table with columns interaction, interaction_class, name
+#' @param focal character vector of conditions to score
+#' @param background character vector of conditions forming the comparison set.
+#'   The focal condition itself is always removed from its own background.
+uniqueness_table <- function(hits, focal, background) {
+  map_dfr(focal, function(cond) {
+    bg <- setdiff(background, cond)
+    map_dfr(CLASSES, function(cls) {
+      focal_genes <- hits %>%
+        filter(interaction == cond, interaction_class == cls) %>%
+        pull(name) %>% unique()
+      bg_genes <- hits %>%
+        filter(interaction %in% bg, interaction_class == cls) %>%
+        pull(name) %>% unique()
+      n_total <- length(focal_genes)
+      n_unique <- length(setdiff(focal_genes, bg_genes))
+      tibble(interaction = cond,
+             interaction_class = cls,
+             n_total = n_total,
+             n_unique = n_unique,
+             pct_unique = if (n_total > 0) n_unique / n_total * 100 else NA_real_)
+    })
+  }) %>%
+    mutate(interaction_class = factor(interaction_class, levels = CLASSES))
+}
+```
+
+## Primary: TGFb x TNF vs other TGFb / TNF interactions
+
+```{r}
+uniqFocal <- uniqueness_table(classHits, focalPlotConditions, backgroundConditions)
+uniqFocal
+
+stopifnot(all(uniqFocal$n_unique <= uniqFocal$n_total))
+
+# sanity: if a condition is in its own background it can have no unique genes
+uniqueness_table(classHits, focalPlotConditions[1],
+                 union(backgroundConditions, focalPlotConditions[1])) %>%
+  summarise(all_zero = all(n_unique == 0, na.rm = TRUE))
+```
+
+```{r, fig.width=8, fig.height=5}
+barOrder <- uniqFocal %>%
+  filter(interaction_class == "synergy positive") %>%
+  arrange(desc(pct_unique)) %>%
+  pull(interaction)
+
+uniqFocal %>%
+  filter(!is.na(pct_unique)) %>%
+  mutate(interaction = factor(interaction, levels = barOrder)) %>%
+  ggplot(aes(x = interaction, y = pct_unique, fill = interaction_class)) +
+    geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+    geom_text(aes(label = n_total), position = position_dodge(width = 0.8),
+              vjust = -0.4, size = 3) +
+    scale_fill_manual(values = interaction_palette, breaks = CLASSES) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+    labs(x = "TGFB1 x TNF-family condition",
+         y = "% of unique class hits",
+         fill = "Interaction Class",
+         title = "Uniqueness of interaction hits\nvs other TGFb / TNF interactions",
+         subtitle = "labels = total number of genes in that class for that condition") +
+    theme(aspect.ratio = 1,
+          axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(file.path(outs_dir, "plots/tgfb_tnf_unique_class_percent_barplot.pdf"))
+```
+
+## Family-level: the TGFB1 x TNF-family set as a whole
+
+```{r}
+family_uniqueness <- map_dfr(CLASSES, function(cls) {
+  focal_genes <- classHits %>%
+    filter(interaction %in% focalPlotConditions, interaction_class == cls) %>%
+    pull(name) %>% unique()
+  bg_genes <- classHits %>%
+    filter(interaction %in% backgroundConditions, interaction_class == cls) %>%
+    pull(name) %>% unique()
+  tibble(interaction_class = cls,
+         n_total = length(focal_genes),
+         n_unique = length(setdiff(focal_genes, bg_genes)),
+         pct_unique = length(setdiff(focal_genes, bg_genes)) / length(focal_genes) * 100)
+}) %>%
+  mutate(interaction_class = factor(interaction_class, levels = CLASSES))
+
+family_uniqueness
+```
+
+```{r, fig.width=5, fig.height=5}
+family_uniqueness %>%
+  ggplot(aes(x = interaction_class, y = pct_unique, fill = interaction_class)) +
+    geom_col(width = 0.7) +
+    geom_text(aes(label = paste0(n_unique, "/", n_total)), vjust = -0.4, size = 3) +
+    scale_fill_manual(values = interaction_palette, breaks = CLASSES) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+    labs(x = NULL, y = "% of unique genes",
+         fill = "Interaction Class",
+         title = "TGFB1 x TNF family\nvs other TGFb / TNF interactions") +
+    theme(aspect.ratio = 1,
+          axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(file.path(outs_dir, "plots/tgfb_tnf_family_unique_class_percent_barplot.pdf"))
+```
+
+```{r}
+# export tables
+readr::write_csv(uniqFocal, file.path(out_dir, "uniqueness_by_condition_class.csv"))
+
+uniqueGenes <- map_dfr(focalPlotConditions, function(cond) {
+  bg <- setdiff(backgroundConditions, cond)
+  map_dfr(CLASSES, function(cls) {
+    focal_genes <- classHits %>% filter(interaction == cond, interaction_class == cls) %>%
+      pull(name) %>% unique()
+    bg_genes <- classHits %>% filter(interaction %in% bg, interaction_class == cls) %>%
+      pull(name) %>% unique()
+    tibble(interaction = cond, interaction_class = cls,
+           name = setdiff(focal_genes, bg_genes))
+  })
+})
+
+readr::write_csv(uniqueGenes, file.path(out_dir, "unique_genes_tgfb_tnf.csv"))
+uniqueGenes %>% count(interaction, interaction_class)
+```
+
+## Per-gene examples
+
+Top unique positive-synergy genes of `TGFB1_TNF` by interaction significance, shown across
+all TGFb / TNF conditions. Single-ligand arms are placed on the diagonal (as in `01`) by
+setting their expected LFC to the observed LFC.
+
+```{r, fig.width=10, fig.height=10}
+exampleGenes <- interAnnot %>%
+  filter(interaction == "TGFB1_TNF", interaction_class == "synergy positive") %>%
+  semi_join(uniqueGenes %>% filter(interaction == "TGFB1_TNF",
+                                   interaction_class == "synergy positive"),
+            by = "name") %>%
+  slice_min(adj_pval_interaction, n = 4) %>%
+  pull(name)
+
+exampleGenes
+```
+
+```{r, fig.width=8, fig.height=8}
+# single-ligand arms for the TGFb / TNF ligands, forced onto the diagonal
+singleArms <- interScoredSig %>%
+  filter(grepl("^linker_(TGFB1|TNF|TNFSF4|TNFSF15|TNFSF18)$|^(TGFB1|TNF)_linker$", interaction)) %>%
+  mutate(family_group = "single ligand",
+         lfc_expected = lfc_condition)
+
+exampleData <- interAnnot %>%
+  select(name, interaction, lfc_expected, lfc_condition, family_group, interaction_class) %>%
+  mutate(family_group = as.character(family_group)) %>%
+  bind_rows(singleArms %>% select(name, interaction, lfc_expected, lfc_condition,
+                                  family_group, interaction_class)) %>%
+  mutate(family_group = factor(family_group,
+                               levels = c("TGFb x TNF","TGFb other","TNF other","single ligand")))
+
+group_colors <- c("TGFb x TNF" = "#DC267F",
+                  "TGFb other" = "#FFB000",
+                  "TNF other"  = "#648FFF",
+                  "single ligand" = "grey20")
+
+plot_gene <- function(g) {
+  d <- exampleData %>% filter(name == g, !is.na(family_group))
+  ggplot(d, aes(x = lfc_expected, y = lfc_condition)) +
+    geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    geom_point(aes(color = family_group, size = family_group == "TGFb x TNF")) +
+    geom_text_repel(data = d %>% filter(family_group == "TGFb x TNF"),
+                    aes(label = interaction), size = 2.5,
+                    max.overlaps = 100, min.segment.length = 0) +
+    scale_color_manual(values = group_colors) +
+    scale_size_manual(values = c(`FALSE` = 1, `TRUE` = 2.4), guide = "none") +
+    xlab("expected LFC") +
+    ylab("observed LFC") +
+    labs(color = NULL) +
+    ggtitle(g) +
+    theme(aspect.ratio = 1)
+}
+
+wrap_plots(map(exampleGenes, plot_gene), ncol = 2) + plot_layout(guides = "collect")
+ggsave(file.path(outs_dir, "plots/tgfb_tnf_unique_synergy_gene_examples.pdf"))
+```
+

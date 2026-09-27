@@ -1,5 +1,5 @@
 # signal_seq_2026
-This repository contains the analysis code, custom functions, and reproducibility environments for the 2026 Signal-seq manuscript. This repo and the `imports_stable` data directory can be found at zenodo: **large file, will be made available upon publication**  
+This repository contains the analysis code, custom functions, and reproducibility environments for the 2026 Signal-seq manuscript. The `imports_stable` data directory is distributed separately as per-experiment Zenodo records (see `imports_stable/README.md` for the list): **will be made available upon publication**  
 
 ## Repository Structure
 
@@ -75,7 +75,7 @@ Scripts use no absolute paths. Each one finds the repository root by searching u
 
 The code in this repository runs against the `imports_stable/` data folder, which is downloaded separately.
 
-1. **Get the data.** Download the `imports_stable/` folder (~207 GB) and place it at the root of the cloned repository, so that the layout is `signal_seq_2026/imports_stable/SIG13/`, `signal_seq_2026/imports_stable/SIG18/`, and so on. A symbolic link named `imports_stable` pointing to a copy stored elsewhere also works. Its layout is shown [below](#imports_stable-layout).
+1. **Get the data.** `imports_stable/` (~207 GB total) is distributed as separate Zenodo records, one per experiment (or, for the large SIG13 experiment, one per subfolder). Download the record(s) covering the modules you plan to run, unzip each into the root of the cloned repository, so that the layout is `signal_seq_2026/imports_stable/SIG13/`, `signal_seq_2026/imports_stable/SIG18/`, and so on. A symbolic link named `imports_stable` pointing to a copy stored elsewhere also works. See `imports_stable/README.md` for the full list of folders and their Zenodo records, and the layout [below](#imports_stable-layout).
 2. **Add the data that is not included, if needed.**
     * The public datasets used for disease scoring and AMP validation in `03_activity_inference_model` (AMP 2023, Inflammation Atlas, Thomas IBD) were not generated in this study. Obtain the processed CD4 T cell objects and place them at the paths the scripts expect:
         * `imports_stable/external/AMP_2023/amp_2023_cd4_processed.h5ad` and `imports_stable/external/AMP_2023/2023_AMP2_CTAP.csv` (AMP 2023 rheumatoid arthritis synovium)

@@ -1,7 +1,8 @@
 # Project
 /analysis_outs
 /processing_outs
-/imports_stable
+/imports_stable/*
+!/imports_stable/README.md
 
 # VS Code
 /.vscode

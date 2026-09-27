@@ -4,28 +4,37 @@ Frozen copies of every input file the analysis scripts read. Scripts read from h
 
 This includes both inputs generated in this study (Cell Ranger outputs, FASTQs, bulk RNA-seq count matrices, ATAC-seq peak data) and files produced by earlier steps of this repo's pipelines. The earlier-step outputs are included so each script can be run on its own against the exact files used in the manuscript. Re-running an upstream step writes a fresh copy to `analysis_outs/` and does not change `imports_stable/`.
 
-This folder itself (~215 GB) is not tracked in git (see `.gitignore`); only this README is tracked. The data is distributed separately via Zenodo, one record (zip) per experiment, as described below.
+This folder itself (~215 GB) is not tracked in git (see `.gitignore`); only this README is tracked. The data is distributed separately via Zenodo as one `.tar.gz` archive per row below (SIG13 is split by subfolder to keep archives smaller), built by `make_tarballs.sh`.
 
 ## Recreating `imports_stable/`
 
-Each experiment's inputs are archived as a separate Zenodo record. Download the record(s) you need, unzip, and place the contents directly under `imports_stable/<experiment>/` at the root of the cloned repo (so the layout is `signal_seq_2026/imports_stable/SIG13/cellranger/...`, `signal_seq_2026/imports_stable/SIG18/...`, and so on). Each zip's internal folder structure matches the destination path in the table below exactly, so it can be unzipped straight into `imports_stable/`.
+Download the archive(s) you need and extract each at the root of the cloned repo (not inside `imports_stable/` — every archive stores paths as `imports_stable/<...>` so it recreates the right subfolder itself):
 
-You don't need all of them — only the folders read by the modules you plan to run (each module's own `README.md`, and the main repo `README.md`, list which `imports_stable/<experiment>/` paths it reads).
+```bash
+tar -xzf SIG13_cellranger.tar.gz -C /path/to/signal_seq_2026
+```
 
-| Folder | Contents | Zenodo record |
-|---|---|---|
-| `SIG13/cellranger/` | Cell Ranger `per_sample_outs` files (filtered/raw h5, protospacer calls) | `<DOI TBD>` |
-| `SIG13/scanpy_outs/` | processed h5mu/h5ad objects, z-score and cutoff-sweep h5ads | `<DOI TBD>` |
-| `SIG13/analysis_outs/` | glmGamPoi results, sPCA, clustering, QC and activity-model outputs | `<DOI TBD>` |
-| `SIG13/analysis_outs_zumpano/` | ligand signature validation and GSEA tables | `<DOI TBD>` |
-| `SIG07/analysis_outs/` | SIG07 glmGamPoi results (inter-assay comparison) | `<DOI TBD>` |
-| `SIG02/`, `SIG03/` | barcode comparison h5mu objects | `<DOI TBD>` |
-| `SIG14/`, `SIG18/`, `SIG26/`, `SIG29/`, `SIG30/` | bulk RNA-seq `processing_outs` and `analysis_outs` | `<DOI TBD>` |
-| `SIG16/` | bulk ATAC-seq peak-atlas counts, ChIPseeker annotation, FIMO motif matrix, and DESeq2 / interaction outputs of the ATAC steps | `<DOI TBD>` |
-| `SIG17/` | CRISPR screen dedup pipeline outputs (raw FASTQs not included, see Not included) | `<DOI TBD>` |
-| `SIG19/` | Treg-depletion h5ads and cluster DE tables | `<DOI TBD>` |
+You don't need all of them — only the archives read by the modules you plan to run (each module's own `README.md`, and the main repo `README.md`, list which `imports_stable/<experiment>/` paths it reads).
 
-Links will be filled in as each record is published (see the main `README.md` for the top-level Zenodo landing page). Because `SIG13` is large (~181 GB) it is split across multiple Zenodo records by subfolder, as shown above; every other experiment is one record per folder.
+| Archive | Destination | Contents | Zenodo record |
+|---|---|---|---|
+| `SIG02.tar.gz` | `SIG02/` | barcode comparison h5mu objects | `<DOI TBD>` |
+| `SIG03.tar.gz` | `SIG03/` | barcode comparison h5mu objects | `<DOI TBD>` |
+| `SIG07.tar.gz` | `SIG07/` | SIG07 glmGamPoi results (inter-assay comparison) | `<DOI TBD>` |
+| `SIG13_cellranger.tar.gz` | `SIG13/cellranger/` | Cell Ranger `per_sample_outs` files (filtered/raw h5, protospacer calls) | `<DOI TBD>` |
+| `SIG13_scanpy_outs.tar.gz` | `SIG13/scanpy_outs/` | processed h5mu/h5ad objects, z-score and cutoff-sweep h5ads | `<DOI TBD>` |
+| `SIG13_analysis_outs.tar.gz` | `SIG13/analysis_outs/` | glmGamPoi results, sPCA, clustering, QC and activity-model outputs | `<DOI TBD>` |
+| `SIG13_analysis_outs_zumpano.tar.gz` | `SIG13/analysis_outs_zumpano/` | ligand signature validation and GSEA tables | `<DOI TBD>` |
+| `SIG14.tar.gz` | `SIG14/` | bulk RNA-seq `processing_outs` and `analysis_outs` | `<DOI TBD>` |
+| `SIG16.tar.gz` | `SIG16/` | bulk ATAC-seq peak-atlas counts, ChIPseeker annotation, FIMO motif matrix, and DESeq2 / interaction outputs of the ATAC steps | `<DOI TBD>` |
+| `SIG17.tar.gz` | `SIG17/` | CRISPR screen dedup pipeline outputs (raw FASTQs not included, see Not included) | `<DOI TBD>` |
+| `SIG18.tar.gz` | `SIG18/` | bulk RNA-seq `processing_outs` and `analysis_outs` | `<DOI TBD>` |
+| `SIG19.tar.gz` | `SIG19/` | Treg-depletion h5ads and cluster DE tables | `<DOI TBD>` |
+| `SIG26.tar.gz` | `SIG26/` | bulk RNA-seq `processing_outs` and `analysis_outs` | `<DOI TBD>` |
+| `SIG29.tar.gz` | `SIG29/` | bulk RNA-seq `processing_outs` and `analysis_outs` | `<DOI TBD>` |
+| `SIG30.tar.gz` | `SIG30/` | bulk RNA-seq `processing_outs` and `analysis_outs` | `<DOI TBD>` |
+
+Links will be filled in as each record is published (see the main `README.md` for the top-level Zenodo landing page).
 
 A symbolic link named `imports_stable` pointing to a copy stored elsewhere (e.g. scratch space) also works in place of a real folder, as long as the same subfolder structure is kept underneath it.
 

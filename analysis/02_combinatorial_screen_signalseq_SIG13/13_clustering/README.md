@@ -78,13 +78,13 @@ consistency threshold is applied). Each biological pair then contributes exactly
 
 All paths are under `imports_stable/SIG13/analysis_outs/` unless noted.
 
-- `glmGamPoi/glmGamPoi_interaction/glmGamPoi_coefficients_{cutoff}filter.csv`: interaction GLM
-  coefficients, 8 cutoffs.
-- `glmGamPoi/glmGamPoi_single_term/glmGamPoi_coefficients_{cutoff}filter.csv`: single-term GLM
-  coefficients, 8 cutoffs.
+- `glmGamPoi/glmGamPoi_interaction_coefficients_{cutoff}filter.csv`: interaction GLM
+  coefficients; `01`-`04` read 8 cutoffs (see the note below).
+- `glmGamPoi/glmGamPoi_singleTerm_coefficients_{cutoff}filter.csv`: single-term GLM
+  coefficients; `01`-`04` read 8 cutoffs.
 - `glmGamPoi/interactions_scored_v3_glmGamPoi_{cutoff}filter_sig.csv`: interaction HVG source, and
   the interaction-class counts in `05`/`06`.
-- `glmGamPoi/glmGamPoi_single_term/glmGamPoi_singleTerm_lfc_sig_{cutoff}filter.csv`: single-ligand
+- `glmGamPoi/glmGamPoi_singleTerm_lfc_sig_{cutoff}filter.csv`: single-ligand
   HVG source, and the DEG counts in `05`/`06`.
 - `replicate_corr/replicate_correlation_{interactionLfc,singleLfc}_0.2filter.csv`: consistency
   filter.
@@ -93,6 +93,13 @@ All paths are under `imports_stable/SIG13/analysis_outs/` unless noted.
 - `clustering/hdbscan_bootstrap_modal_clusters{suffix}_minSamples1[_unique].csv`: stable copies of
   the `01`-`04` modal clusters, read by `05`/`06`. Re-running `01`-`04` writes fresh files to
   `analysis_outs/` only.
+
+Only the 0.05, 0.1 and 0.2 cutoffs of the GLM files above are in `imports_stable/`. To run the
+filter-cutoff sweep in `01`-`04`, first regenerate 0.15, 0.25, 0.3, 0.35 and 0.4 with
+`../05_interaction_scoring` (both GLMs and the scoring script, run with each cutoff as the
+`filter_cutoff` argument), then copy the output flat into `imports_stable/SIG13/analysis_outs/glmGamPoi/`,
+renaming each model's `glmGamPoi_coefficients_*` as described in `../05_interaction_scoring/README.md`.
+`05`-`07` read only 0.2filter and still run from `imports_stable/`.
 
 ## Outputs
 

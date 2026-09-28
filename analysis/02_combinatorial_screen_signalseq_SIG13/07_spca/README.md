@@ -75,7 +75,7 @@ replicate-driven, which leaves 68 "clean" programs. Those 68 are what the downst
   `_pb.h5ad`): control-normalized DEG-subset expression built by
   `01_processing/02_zscore_deg_processing.ipynb`. The genes are single-term GLM DEGs at
   `adj_pval < 0.01`. The normalization is
-  `perturbseq.normalize_to_control_adata_multithread` (`functions/perturbseq/zscore_multithread.py`),
+  `perturbseq.normalize_to_control_adata` (`functions/perturbseq/expression_normalization.py`),
   run with `control_cells_query='ligand_call_DSB7 == "linker_linker"'` and
   `groupby_column='replicate_lane'`.
 - `imports_stable/SIG13/scanpy_outs/SIG13_doublets_DSB7.h5ad`: `log1p_norm` expression for

@@ -107,6 +107,9 @@ SIG13_doublets_DSB7.h5ad                    imports_stable/SIG13/scanpy_outs/
 SIG14 and SIG26 counts                      imports_stable/{SIG14,SIG26}/processing_outs/
 ```
 
+`SIG13_doublets_DSB7.h5ad` is not in the Zenodo deposit; download it from GEO
+([GSE318270](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE318270)).
+
 Step 02 reads the explanatory matrix from its stable copy in
 `imports_stable/SIG13/analysis_outs/inference_model_final/`, and 04 reads the calibration
 scores from `imports_stable/SIG13/analysis_outs/inference_model_calibration/`. Re-running

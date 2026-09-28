@@ -73,7 +73,7 @@ interScored <- data.table::fread(
 # inter-replicate correlations
 conditionLfcRep <- readr::read_csv(file.path(imports_dir, "SIG13/analysis_outs/replicate_corr/replicate_correlation_singleLfc_0.2filter.csv"))
 interLfcRep <- readr::read_csv(file.path(imports_dir, "SIG13/analysis_outs/replicate_corr/replicate_correlation_interactionLfc_0.2filter.csv"))
-singleLfc <- readr::read_csv(file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/glmGamPoi_single_term/glmGamPoi_singleTerm_lfc_0.05filter.csv"))
+singleLfc <- readr::read_csv(file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/glmGamPoi_singleTerm_lfc_0.05filter.csv"))
 ```
 
 # Filter and annotate data

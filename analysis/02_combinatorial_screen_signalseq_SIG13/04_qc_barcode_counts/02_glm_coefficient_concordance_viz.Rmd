@@ -37,8 +37,8 @@ Full-dataset production GLM outputs (`05_interaction_scoring/glmGamPoi_interacti
 the top30/bottom30/random30 count-subset equivalents from `01_glmGamPoi_interaction_countSubset_slurm.r`.
 
 ```{r}
-full_singles <- read_csv(file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/glmGamPoi_interaction/glmGamPoi_singles_lfc_0.1filter.csv"))
-full_inter   <- read_csv(file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/glmGamPoi_interaction/glmGamPoi_interaction_lfc_0.1filter.csv"))
+full_singles <- read_csv(file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/glmGamPoi_singles_lfc_0.1filter.csv"))
+full_inter   <- read_csv(file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/glmGamPoi_interaction_lfc_0.1filter.csv"))
 
 load_subset <- function(count_subset) {
   dir <- file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi", paste0("glmGamPoi_interaction_", count_subset, "count"))

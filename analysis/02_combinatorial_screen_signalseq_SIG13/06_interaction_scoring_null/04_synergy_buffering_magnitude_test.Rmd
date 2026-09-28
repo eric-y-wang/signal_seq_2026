@@ -29,8 +29,8 @@ source(file.path(repo_dir, "functions/r_custom/plotting_fxns.R"))
 theme_set(theme_Publication())
 
 filter_cutoff <- 0.1
-real_interaction_dir <- file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/glmGamPoi_interaction")
-null_dir <- file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/glmGamPoi_null")
+real_interaction_dir <- file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi")
+null_dir <- file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi")
 plot_dir <- file.path(outs_dir, "plots/interaction_scoring_null")
 
 source_pal <- c(null = "#666666FF", real = "#1B9E77FF")

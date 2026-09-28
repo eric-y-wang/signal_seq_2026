@@ -62,12 +62,14 @@ therefore does not change the Gata3 results.
   (`imports_stable/SIG17/raw_fastq/merged/`). These are not included in `imports_stable/`;
   download them from GEO ([GSE348675](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE348675))
   into that folder before running step 01.
-- Steps 02-04 read the stable copies of the previous step's outputs from `IN_DIR`
-  (`imports_stable/SIG17/dedup_pipeline_output/`), so each step can run on its own:
-  `01_umi_extract/SIG17_{1..4}_R1.umi.fastq.gz` (02), `02_guide_dedup/SIG17_{1..4}_R1.dedup.fastq.gz`
-  (03) and `03_mageck_dedup/SIG17_gata3_dedup.count.txt` (04, via `COUNT_TABLE`). To chain the
-  steps on fresh outputs instead, set `IN_DIR=$OUT_DIR` and point `COUNT_TABLE` at
-  `${OUT_DIR}/03_mageck_dedup/SIG17_gata3_dedup.count.txt`.
+- Steps 02-04 read the previous step's outputs from `IN_DIR`
+  (default `imports_stable/SIG17/dedup_pipeline_output/`): `01_umi_extract/SIG17_{1..4}_R1.umi.fastq.gz`
+  (02), `02_guide_dedup/SIG17_{1..4}_R1.dedup.fastq.gz` (03) and
+  `03_mageck_dedup/SIG17_gata3_dedup.count.txt` (04, via `COUNT_TABLE`). Of these, only the
+  step 03 count table is in `imports_stable/`, so only step 04 can run on its own. The step 01-02
+  fastqs are not included (the `02_guide_dedup/` QC tables are); regenerate them by running
+  steps 01-02 on the GEO fastqs with `IN_DIR=$OUT_DIR` (and `COUNT_TABLE` pointed at
+  `${OUT_DIR}/03_mageck_dedup/SIG17_gata3_dedup.count.txt` to chain through 04).
 - `mageck_library.csv`: sgRNA library (`sgRNA_id,sequence,gene`; 1,974 sgRNAs, 4 per targeting
   gene, plus 47 `control_NT` and 47 `control_cutting`).
 - `mageck_control_id.txt`: negative-control sgRNA IDs.

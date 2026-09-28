@@ -34,9 +34,9 @@ single-term GLM results in `../05_interaction_scoring`
 
 All paths are under `imports_stable/SIG13/analysis_outs/`.
 
-- `glmGamPoi/glmGamPoi_single_term/glmGamPoi_singleTerm_lfc_0.1filter.csv`:
+- `glmGamPoi/glmGamPoi_singleTerm_lfc_0.1filter.csv`:
   single-term condition LFCs and adjusted p-values (`01`, `02`).
-- `glmGamPoi/glmGamPoi_single_term/glmGamPoi_coefficients_0.1filter.csv`: loaded by
+- `glmGamPoi/glmGamPoi_singleTerm_coefficients_0.1filter.csv`: loaded by
   `02` but not used in the current plots.
 
 `01` reads cached intermediate tables (`ligand_signature_validation_linkers.csv`,

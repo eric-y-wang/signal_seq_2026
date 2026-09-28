@@ -57,12 +57,15 @@ Barcode-calling QC itself, and the effect of changing the DSB threshold, are in
 
 All from `imports_stable/SIG13/`:
 - `scanpy_outs/SIG13_doublets_DSB7.h5ad`: the production DSB7 cell set (01, 03).
-- `analysis_outs/glmGamPoi/glmGamPoi_interaction/`: production GLM output (02).
+- `analysis_outs/glmGamPoi/`: production GLM output (02).
 - `analysis_outs/replicate_corr/replicate_correlation_interactionLfc_0.2filter.csv` (02).
 - `analysis_outs/spca/`: sPCA loadings and production waggr scores (03).
-- Stable copies of this folder's own earlier-step outputs: the per-subset GLM output (read
-  by 02) and the 03 scores (read by 04). Re-running 01 or 03 writes fresh files to
-  `analysis_outs/` only.
+- The 03 scores (read by 04). Re-running 03 writes fresh files to `analysis_outs/` only.
+
+The per-subset GLM output (`glmGamPoi_interaction_{top30,bottom30,random30}count/`) and
+`correlation_diff_barcode_cutoffs.csv` are not in `imports_stable/`. To knit 02, run 01 for
+all three subsets, then copy the output into `imports_stable/SIG13/analysis_outs/glmGamPoi/`,
+where 02 reads it. 03 and 04 still run from `imports_stable/`.
 
 ## Outputs
 

@@ -68,15 +68,25 @@ Every term is tested with `glmGamPoi::test_de` (quasi-likelihood F test, BH-adju
 - `imports_stable/SIG13/scanpy_outs/SIG13_doublets_DSB7.h5ad`: the `counts` layer, and
   `ligand_call_DSB7`, `replicate`, `lane`, `pct_counts_mt`, `S_score` and `G2M_score` in `obs`.
 - `interaction_scoring_v3.R` reads the stable copies of both GLMs' outputs from
-  `imports_stable/SIG13/analysis_outs/glmGamPoi/{glmGamPoi_single_term,glmGamPoi_interaction}/`.
-  Re-running the GLMs writes fresh files to `analysis_outs/` only.
+  `imports_stable/SIG13/analysis_outs/glmGamPoi/`. Re-running the GLMs writes fresh files to
+  `analysis_outs/` only.
+
+The stable copies in `imports_stable/SIG13/analysis_outs/glmGamPoi/` are flat: the files from
+the `glmGamPoi_single_term/`, `glmGamPoi_interaction/`, `_independent_replicates/` and
+`glmGamPoi_null/` output subfolders below sit together in that one folder. Both GLMs write a
+`glmGamPoi_coefficients_{cutoff}filter.csv`, so the stable copies are renamed
+`glmGamPoi_interaction_coefficients_{cutoff}filter.csv` and
+`glmGamPoi_singleTerm_coefficients_{cutoff}filter.csv`. To replace a stable copy with a fresh
+fit, copy the files out of the subfolder, renaming the coefficients file the same way.
 
 ## Outputs
 
 All outputs are written under `analysis_outs/02_combinatorial_screen_signalseq_SIG13/glmGamPoi/`,
 which is gitignored. All three steps
 have been run at `filter_cutoff` 0.05-0.4 (step 0.05). Downstream analyses mostly use 0.05filter
-(gene-level classes) and 0.2filter (coefficients for clustering, replicate correlations).
+(gene-level classes) and 0.2filter (coefficients for clustering, replicate correlations). Only
+the 0.05, 0.1 and 0.2 outputs are in `imports_stable/`; the others are needed only for the
+`13_clustering` filter-cutoff sweep (see its README).
 
 - `glmGamPoi_single_term/`:
   - `glmGamPoi_singleTerm_lfc_{cutoff}filter.csv`: condition LFCs, and `_sig_` for

@@ -50,7 +50,7 @@ other cutoffs come from `04_glmGamPoi_interaction_cutoff_slurm.r`.
 
 ```{r}
 glm_dir <- function(k) {
-  if (k == ref_cutoff) file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/glmGamPoi_interaction")
+  if (k == ref_cutoff) file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi")
   else file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi", paste0("glmGamPoi_interaction_DSB", k))
 }
 

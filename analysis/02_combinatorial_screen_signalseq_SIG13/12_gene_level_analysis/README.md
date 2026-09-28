@@ -79,7 +79,7 @@ All paths are under `imports_stable/SIG13/analysis_outs/`.
 
 - `glmGamPoi/interactions_scored_v3_glmGamPoi_0.05filter.csv`: gene x interaction scores and
   classes (`01`, `02`, `04`); `03` reads the `_sig` version.
-- `glmGamPoi/glmGamPoi_single_term/glmGamPoi_singleTerm_lfc_0.05filter.csv`: single-term DEGs, for
+- `glmGamPoi/glmGamPoi_singleTerm_lfc_0.05filter.csv`: single-term DEGs, for
   the >50 DEG condition filter.
 - `replicate_corr/replicate_correlation_{singleLfc,interactionLfc}_0.2filter.csv`: consistency
   filters.

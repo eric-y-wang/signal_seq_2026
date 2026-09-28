@@ -41,9 +41,10 @@ All from `imports_stable/SIG13/`:
   reference loadings
 - `analysis_outs/spca/lm_fit_zscore_degs_allLigands_0.1_alpha1.0_sPCA_clean.csv`: clean
   program list
-- `analysis_outs/spca_stability/{alpha_sweep,bootstrap/components}/`: stable copies of the `01`
-  and `03` fits, which `02` and `04` read. Re-running `01`/`03` writes fresh fits to
-  `analysis_outs/` only.
+- `analysis_outs/spca_stability/{alpha_sweep,bootstrap/components}/`: the `01` and `03` fits,
+  which `02` and `04` read. These are not in `imports_stable/`. Run `01` and `03`, then copy
+  `analysis_outs/02_combinatorial_screen_signalseq_SIG13/spca_stability/` to
+  `imports_stable/SIG13/analysis_outs/spca_stability/` before running `02` and `04`.
 
 ## Outputs
 

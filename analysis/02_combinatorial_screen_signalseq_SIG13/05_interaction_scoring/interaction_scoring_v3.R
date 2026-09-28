@@ -23,11 +23,11 @@ filter_suffix <- paste0(filter_cutoff, "filter")
 #### IMPORT ####
 
 # import LFC from non-interaction model (glmGamPoi_single_term_slurm.R output)
-base_dir <- file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/glmGamPoi_single_term/")
+base_dir <- file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/")
 conditionLfc <- read_csv(paste0(base_dir,"glmGamPoi_singleTerm_lfc_",filter_suffix,".csv"))
 
 # import LFC coefficents from interaction model (glmGamPoi_interaction_slurm.R output)
-base_dir <- file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/glmGamPoi_interaction/")
+base_dir <- file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/")
 interactionsLfc <- read_csv(paste0(base_dir,"/glmGamPoi_interaction_lfc_",filter_suffix,".csv"))
 interSig <- interactionsLfc %>% filter(adj_pval < 0.1)
 singlesLfc <- read_csv(paste0(base_dir,"glmGamPoi_singles_lfc_",filter_suffix,".csv"))

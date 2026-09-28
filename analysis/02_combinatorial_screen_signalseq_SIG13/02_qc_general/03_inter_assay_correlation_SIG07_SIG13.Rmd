@@ -158,7 +158,7 @@ ggplot(correlation_results, aes(x = pearson_corr)) +
 
 ```{r}
 sig07_data_singles <- read_csv(file.path(imports_dir, "SIG07/analysis_outs/glmGamPoi/glmGamPoi_interaction/glmGamPoi_singles_lfc_0.05filter.csv"))
-sig13_data_singles <- read.csv(file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/glmGamPoi_single_term/glmGamPoi_singleTerm_lfc_0.05filter.csv"))
+sig13_data_singles <- read.csv(file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/glmGamPoi_singleTerm_lfc_0.05filter.csv"))
 ```
 
 ```{r}

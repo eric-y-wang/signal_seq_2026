@@ -81,22 +81,28 @@ each cell received in a way that affects results? (It cannot, because it is conf
 ## Inputs
 
 - `imports_stable/SIG13/scanpy_outs/SIG13_full_bc_processed.h5mu`: all 628,244 cells before doublet filtering, with
-  DSB-normalized barcode scores and RNA counts. Every threshold is derived from it.
+  DSB-normalized barcode scores and RNA counts. Every threshold is derived from it. Download it
+  from GEO ([GSE318270](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE318270)).
 - `imports_stable/SIG13/analysis_outs/spca/zscore_degs_allLigands_0.1_alpha1.0_sPCA_loadings.csv`:
   sPCA loadings (78 components).
-- Production DSB7 GLM output (`imports_stable/SIG13/analysis_outs/glmGamPoi/glmGamPoi_interaction/`)
+- Production DSB7 GLM output (`imports_stable/SIG13/analysis_outs/glmGamPoi/`)
   and waggr scores (`imports_stable/SIG13/analysis_outs/spca/degs_zscore_allLigands/`).
 - `imports_stable/SIG13/analysis_outs/replicate_corr/replicate_correlation_interactionLfc_0.2filter.csv`:
   reproducibility filter (`pearson_corr > 0.25 & num_shared_genes > 1`).
 
 The later steps read the stable copies of the earlier steps' outputs in
-`imports_stable/SIG13/`: 05 reads the per-threshold GLM output and the 03 tables, and 07
-reads the 06 scores. Re-running an earlier step writes fresh files to `analysis_outs/` only.
+`imports_stable/SIG13/`: 05 reads the 03 tables, and 07 reads the 06 scores. Re-running an
+earlier step writes fresh files to `analysis_outs/` only.
 
 The cutoff-sweep `.h5ad`s (about 74 GB) are **not** in `imports_stable/` because of size
 limitations. To re-run 04 or 06, first run 03, which writes them to
 `analysis_outs/02_combinatorial_screen_signalseq_SIG13/scanpy_outs/cutoff_sweep/`; 04 and 06 read
 them from there. 05 and 07 do not need them.
+
+The per-threshold GLM output (`glmGamPoi_interaction_DSB{k}/`) and
+`cutoff_common_units.csv` are also not in `imports_stable/`. To knit 05, run 03 and 04, then
+copy `glmGamPoi_interaction_DSB{k}/` into `imports_stable/SIG13/analysis_outs/glmGamPoi/`,
+where 05 reads it. 07 still runs from `imports_stable/`.
 
 ## Outputs
 

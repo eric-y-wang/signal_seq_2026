@@ -101,11 +101,21 @@ Rmds, and submit `sbatch` jobs, from inside the repo.
 Every input is read from `imports_stable/`:
 - Cell Ranger files: `imports_stable/SIG13/cellranger/`
 - processed `.h5ad`/`.h5mu`: `imports_stable/SIG13/scanpy_outs/`
-- earlier-step results: `imports_stable/SIG13/analysis_outs/`
+- earlier-step results: `imports_stable/SIG13/analysis_outs/`. The glmGamPoi results are kept
+  flat in `imports_stable/SIG13/analysis_outs/glmGamPoi/`, not in the per-model subfolders the GLM
+  scripts write (see `05_interaction_scoring/README.md`).
 
 This includes files that an earlier folder in this pipeline produces. Those were copied into
 `imports_stable/` so each step runs on its own; re-running an earlier step writes a fresh copy
-to `analysis_outs/` and leaves `imports_stable/` unchanged.
+to `analysis_outs/` and leaves `imports_stable/` unchanged. Exceptions:
+- `SIG13_doublets_DSB7.h5ad` (the input to most steps) and `SIG13_full_bc_processed.h5mu` are
+  not in the Zenodo deposit. Download them from GEO
+  ([GSE318270](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE318270)) into
+  `imports_stable/SIG13/scanpy_outs/`.
+- The cutoff-sweep h5ads and GLM outputs of `03_qc_barcode_cutoff`, the GLM outputs of
+  `04_qc_barcode_counts`, the glmGamPoi outputs at
+  filter cutoffs other than 0.05/0.1/0.2 (used only by the `13_clustering` cutoff sweep), and the
+  `09_spca_stability` fits are not included; see those folders' READMEs.
 
 All outputs are written under `analysis_outs/02_combinatorial_screen_signalseq_SIG13/` (not
 tracked). Each analysis has its own subfolder there (for example `glmGamPoi/`, `spca/`,

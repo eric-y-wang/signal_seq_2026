@@ -87,11 +87,12 @@ interaction:  counts ~ ligand1 * ligand2 + lane + replicate + percent.mito + s.s
 - `imports_stable/SIG13/scanpy_outs/SIG13_doublets_DSB7.h5ad`: `counts` layer, and the
   `feature_call_DSB7`, `ligand_call_round{1,2}_DSB7`, replicate, lane and cell-cycle/mito
   covariates in `obs` (`01`, `02`).
-- `imports_stable/SIG13/analysis_outs/glmGamPoi/glmGamPoi_interaction/glmGamPoi_{interaction,singles}_lfc_0.1filter.csv`:
+- `imports_stable/SIG13/analysis_outs/glmGamPoi/glmGamPoi_{interaction,singles}_lfc_0.1filter.csv`:
   the real fit, written by `05_interaction_scoring/glmGamPoi_interaction_slurm.r` (`03`, `04`).
-- `imports_stable/SIG13/analysis_outs/glmGamPoi/glmGamPoi_null/`: stable copies of the `02`
-  null outputs that `03` and `04` read. Re-running `01`/`02` writes fresh files to
-  `analysis_outs/` only.
+- `imports_stable/SIG13/analysis_outs/glmGamPoi/glmGamPoi_interaction_null_{lfc,singles_lfc}_0.1filter.csv`
+  and `interaction_null_combo_coverage_0.1filter.csv`: stable copies of the `02` null outputs
+  that `03` and `04` read, in the same flat folder as the real fit (the `glmGamPoi_null/`
+  subfolder is not kept there). Re-running `01`/`02` writes fresh files to `analysis_outs/` only.
 
 ## Outputs
 

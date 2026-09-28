@@ -32,8 +32,8 @@ theme_set(theme_Publication())
 filter_cutoff_single <- 0.1
 filter_cutoff_interaction <- 0.1
 
-null_dir <- file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/glmGamPoi_null")
-real_interaction_dir <- file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi/glmGamPoi_interaction")
+null_dir <- file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi")
+real_interaction_dir <- file.path(imports_dir, "SIG13/analysis_outs/glmGamPoi")
 ```
 
 # Goal

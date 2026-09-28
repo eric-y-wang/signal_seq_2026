@@ -1,5 +1,5 @@
 # signal_seq_2026
-This repository contains the analysis code, custom functions, and reproducibility environments for the 2026 Signal-seq manuscript. The `imports_stable` data directory is distributed separately as a single Zenodo deposit (see `imports_stable/README.md` for the archive list): **will be made available upon publication**  
+This repository contains the analysis code, custom functions, and reproducibility environments for the 2026 Signal-seq manuscript. The `imports_stable` data directory is distributed separately (see `imports_stable/README.md`).  
 
 ## Repository Structure
 
@@ -19,7 +19,7 @@ The `analysis/` directory contains the core workflows used to generate the resul
         * **Interaction Model:** Tests for synergistic/antagonistic effects using a 2x2 factorial design ($Ligand1 * Ligand2$).
         * **Single Term Model:** Standard one-vs-reference testing.
         * Interaction scoring and classification, with an empirical null built from linker-only (non-targeting) cells.
-    * **Sparse PCA (sPCA):** Running sPCA on z-scored DEGs to identify GEPs, scoring GEPs, linear modeling to connect ligands to GEP effects, plus null, stability and coherence checks.
+    * **Sparse PCA (sPCA) Acute Gene Expression Program (aGEP) Identification:** Running sPCA on z-scored DEGs to identify aGEPs, scoring aGEPs, linear modeling to connect ligands to aGEP effects, plus null, stability and coherence checks.
     * **Downstream:** Single ligand analysis, gene-level interaction analysis, HDBSCAN clustering of interaction effects, and signal transduction reinforcement testing.
 * **`03_activity_inference_model/`**
     * Ridge regression model, built on the SIG13 sPCA programs, that infers ligand signaling activity from gene expression.
@@ -75,37 +75,11 @@ Scripts use no absolute paths. Each one finds the repository root by searching u
 
 The code in this repository runs against the `imports_stable/` data folder, which is downloaded separately.
 
-1. **Get the data.** `imports_stable/` (~50 GB total) is distributed as a single Zenodo deposit containing one `.tar.gz` archive per experiment (SIG13 split into three archives by subfolder, to keep archives smaller), plus the 12 SIG13 Cell Ranger files and the 28 SIG13 glmGamPoi tables uploaded individually. Download the archive(s) covering the modules you plan to run and extract each at the root of the cloned repository (e.g. `tar -xzf SIG13_scanpy_outs.tar.gz -C /path/to/signal_seq_2026`) — every archive stores paths as `imports_stable/<...>`, so extracting it there recreates the layout `signal_seq_2026/imports_stable/SIG13/`, `signal_seq_2026/imports_stable/SIG18/`, and so on. The individually uploaded files are not archived: place them, with their names unchanged, in `imports_stable/SIG13/cellranger/` (Cell Ranger files) and `imports_stable/SIG13/analysis_outs/glmGamPoi/` (glmGamPoi `.csv` tables, no subfolders). A symbolic link named `imports_stable` pointing to a copy stored elsewhere also works. See `imports_stable/README.md` for the full list of archives and the deposit's DOI, and the layout [below](#imports_stable-layout).
-2. **Add the data that is not included, if needed.**
-    * The public datasets used for disease scoring and AMP validation in `03_activity_inference_model` (AMP 2023, Inflammation Atlas, Thomas IBD) were not generated in this study. Obtain the processed CD4 T cell objects and place them at the paths the scripts expect:
-        * `imports_stable/external/AMP_2023/amp_2023_cd4_processed.h5ad` and `imports_stable/external/AMP_2023/2023_AMP2_CTAP.csv` (AMP 2023 rheumatoid arthritis synovium)
-        * `imports_stable/external/inflammation_atlas_2026/inflammation_atlas_cd4_subset.h5ad` (Inflammation Atlas)
-        * `imports_stable/external/thomas_IBD_2024/thomas_IBD_2024_cd4tcells_processed.h5ad` (Thomas et al. 2024, IBD)
+1. **Get the data.** `imports_stable/` (~50 GB total) is distributed as a Zenodo deposit (https://doi.org/10.5281/zenodo.22997145) with some larger files contained in GEO ([GSE318270](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE318270), [GSE318270](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE318270), [GSE348675](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE348675). 
 
-      The scripts read the `log1p_norm` layer, `var` and the `obs` columns listed in each script's dataset config. The activity scores computed from these datasets are included (`SIG13/analysis_outs/inference_model_disease_bulk/`, `SIG13/analysis_outs/inference_model_disease_sc/`), so the downstream regression and visualization steps run without them.
-    * The raw SIG17 CRISPR screen FASTQs, needed only for the first step of `06_crispr_screen_tgfb_tnf_gata3_SIG17/01_processing`, are on GEO ([GSE348675](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE348675)). Place them in `imports_stable/SIG17/raw_fastq/merged/`. The intermediate fastqs from steps 01-02 are also not included; regenerate them from the GEO fastqs (see the module README).
-    * `SIG13/scanpy_outs/SIG13_doublets_DSB7.h5ad` and `SIG13/scanpy_outs/SIG13_full_bc_processed.h5mu` are on GEO ([GSE318270](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE318270)). Place them in `imports_stable/SIG13/scanpy_outs/`.
-    * The SIG13 cutoff-sweep h5ads (`SIG13/scanpy_outs/cutoff_sweep/`, ~74 GB) are not included because of their size. `02_combinatorial_screen_signalseq_SIG13/03_qc_barcode_cutoff/03_generate_cutoff_datasets.ipynb` regenerates them into `analysis_outs/`. Also not included, and regenerated by re-running the step that makes them: the GLM outputs of `03_qc_barcode_cutoff` and `04_qc_barcode_counts`, the glmGamPoi outputs at filter cutoffs other than 0.05/0.1/0.2 (used only by the `13_clustering` cutoff sweep), and the `09_spca_stability` fits. Each folder's README explains how.
-3. **Create the environments.** Create the conda environments in `environments/` that you need (for example, `conda env create -f environments/scanpy_standard2.yaml`). Each module's `README.md` lists which environment each notebook or script uses.
-4. **Run from inside the repository.** Scripts use no absolute paths: each one finds the repository root by searching upward for `imports_stable/`, so open notebooks, knit R Markdown documents and submit `sbatch` jobs from inside the repository. Every script reads its inputs from `imports_stable/` and writes its outputs to `analysis_outs/<analysis module>/` (not tracked in git). Because `imports_stable/` includes the outputs of earlier pipeline steps, most notebooks and scripts can be run on their own without re-running the steps before it; the exceptions are listed in step 2.
+2. **Create the environments.** Create the conda environments in `environments/` that you need (for example, `mamba env create -f environments/scanpy_standard2.yaml`). Each module's `README.md` lists which environment each notebook or script uses.
+4. **Run from inside the repository.** Scripts use no absolute paths: each one finds the repository root by searching upward for `imports_stable/`, so open notebooks, knit R Markdown documents and submit `sbatch` jobs from inside the repository. Every script reads its inputs from `imports_stable/` and writes its outputs to `analysis_outs/<analysis module>/` (not tracked in git). Because `imports_stable/` includes the outputs of earlier pipeline steps, most notebooks and scripts can be run on their own without re-running the steps before it.
 
-### `imports_stable/` layout
-
-Files are grouped by the experiment or source they came from:
-
-| Folder | Contents |
-|---|---|
-| `SIG13/cellranger/` | Cell Ranger filtered/raw h5 and protospacer calls, one set per lane and replicate (`SIG13_lane{1,2}_rep{1,2}_<file>`; uploaded individually, not archived) |
-| `SIG13/scanpy_outs/` | z-score h5ads (processed objects on GEO and cutoff-sweep h5ads not included, see step 2) |
-| `SIG13/analysis_outs/` | sPCA, clustering, QC and activity-model outputs |
-| `SIG13/analysis_outs/glmGamPoi/` | glmGamPoi GLM results and scored interaction tables, flat (uploaded individually, not archived) |
-| `SIG13/analysis_outs_zumpano/` | ligand signature validation and GSEA tables |
-| `SIG07/analysis_outs/` | SIG07 glmGamPoi results (inter-assay comparison) |
-| `SIG02/`, `SIG03/` | barcode comparison h5mu objects |
-| `SIG14/`, `SIG18/`, `SIG26/`, `SIG29/`, `SIG30/` | bulk RNA-seq `processing_outs` and `analysis_outs` |
-| `SIG16/` | bulk ATAC-seq peak-atlas counts, ChIPseeker annotation, FIMO motif matrix, and DESeq2 / interaction outputs of the ATAC steps |
-| `SIG17/` | CRISPR screen dedup QC and MAGeCK outputs (FASTQs not included, see step 2) |
-| `SIG19/` | Treg-depletion h5ads and cluster DE tables |
 
 ## Figure panels
 

@@ -23,7 +23,7 @@ The `analysis/` directory contains the core workflows used to generate the resul
     * **Downstream:** Single ligand analysis, gene-level interaction analysis, HDBSCAN clustering of interaction effects, and signal transduction reinforcement testing.
 * **`03_activity_inference_model/`**
     * Ridge regression model, built on the SIG13 sPCA programs, that infers ligand signaling activity from gene expression.
-    * **Workflows:** Explanatory matrix construction, model calibration and ROC testing, mixture validation, and application to bulk and single-cell disease datasets (including AMP validation).
+    * **Workflows:** Explanatory matrix construction, model calibration and ROC testing, mixture validation, and application to bulk and single-cell disease datasets (including AMP validation and GATA3/IKZF2/TBX21 expression in the AMP CD4 subsets).
 * **`04_tnf_interaction_ATACseq_SIG16/`**
     * Bulk ATAC-seq of CD4 T cells stimulated with IL4, IL6 or TGFb, with or without TNF.
     * **Workflows:** DESeq2 on the IDR peak atlas, differential accessibility, classification of ligand x TNF interaction effects per peak (compared with SIG13 and SIG18 RNA), and FIMO motif enrichment.

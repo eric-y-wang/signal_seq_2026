@@ -2,7 +2,8 @@
 
 The inference model predicts specific ligand activities in the Tph/Tfh CD4 subsets
 (T-7 IFNG+, T-3 IFNG-) of the `T + F` CTAP in the AMP 2023 rheumatoid arthritis (RA)
-synovium atlas. This folder tests that prediction three ways:
+synovium atlas. This folder tests that prediction three ways, and documents the expression of key
+transcription factors in the same subsets:
 
 1. **Single cell.** Are the pseudobulk activity shifts visible cell by cell, and are
    the matching receptors expressed?
@@ -27,9 +28,13 @@ at `padj < 0.01`) and scored with decoupler ULM.
   mapped mouse -> human, top 100 genes per cluster with genes shared between clusters
   removed. Scored with ULM on donor x subset AMP pseudobulk, centred per donor, and
   tested with Welch's t-test (T-7 vs each other subset) and Tukey HSD.
+- **`04_gata3_ikzf2_expression.ipynb`**: `GATA3`, `IKZF2` (Helios) and `TBX21` (T-bet)
+  expression across the 13 AMP CD4 subsets of the `T + F` CTAP (UMAP, dot plot), then
+  donor x subset pseudobulk (mean `log1p_norm`, >= 10 cells) of T-7, T-3 and T-4 in RA
+  `T + F` vs OA control, tested with Mann-Whitney U (BH across the three subsets per gene).
 
 Run the notebooks in the `scanpy_standard2` env. They are CPU-only. 01 needs the
-activity scores from `../04_inference_model_disease_sc`. 02 and 03 are independent.
+activity scores from `../04_inference_model_disease_sc`. 02, 03 and 04 are independent.
 
 ## Inputs
 
@@ -58,3 +63,6 @@ Written to `analysis_outs/03_activity_inference_model/inference_model_validation
   and figures
 - **03**: files prefixed `sig19_ulm_top100_unique_*` (gene sets, ULM and test tables,
   figures), plus a copy of the ortholog map `mouse_human_orthologs_biomart.csv`
+- **04**: files prefixed `gata3_ikzf2_*`: `_umap_expression_TF.pdf`, `_umap_subset_TF.pdf`,
+  `_dotplot_TF.pdf`, `_pseudobulk_focal.csv`, `_pseudobulk_expression_focal.pdf` and
+  `_ra_vs_control_mannwhitney.csv`

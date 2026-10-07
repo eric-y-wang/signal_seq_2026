@@ -30,7 +30,7 @@ the gene net mapped to human orthologs.
 | `02_inference_model_mixture_validation` | tests whether the model distinguishes a true combinatorial stimulation from a 50:50 mixture of cells stimulated with each ligand alone |
 | `03_inference_model_disease_bulk` | scores four CD4 T cell datasets per sample and tests which activities track disease or treatment |
 | `04_inference_model_disease_sc` | scores the same four datasets per cell on the GPU |
-| `05_inference_model_validation_AMP` | checks the RA synovium predictions against single-cell activity scores, receptor expression, and in vitro (SIG26) and in vivo (SIG19) signatures |
+| `05_inference_model_validation_AMP` | checks the RA synovium predictions against single-cell activity scores, receptor expression, and in vitro (SIG26) and in vivo (SIG19) signatures, and documents GATA3/IKZF2/TBX21 expression in the CD4 subsets |
 | `model_core` | shared model code (`model_core.py`, `model_core_sc.py`) and the pinned mouse->human ortholog map |
 
 Datasets scored in 03 and 04:

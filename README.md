@@ -147,7 +147,8 @@ Each figure panel generated in this repo, the script that makes it, and the outp
 | C | `03_activity_inference_model/03_inference_model_disease_bulk/09_viz_amp_2023.Rmd` | `amp_tph_comparison_TF_CTAP.pdf` |
 | D | `03_activity_inference_model/05_inference_model_validation_AMP/01_activity_sc_visualization.ipynb` | `inference_model_validation_AMP/pseudobulk_receptor_T3_T7_TFonly_joint_boxplots.pdf` (per-receptor version with test brackets: `pseudobulk_receptor_T3_T7_TFonly.pdf`) |
 | F | `03_activity_inference_model/05_inference_model_validation_AMP/02_deg_gene_sets_sc.ipynb` | `ulm_replicates_barplot_by_condition.pdf` (subset of conditions; full plot in ED Fig. 19G) |
-| H | `03_activity_inference_model/05_inference_model_validation_AMP/03_sig19_ulm_unique_sets.ipynb` | `sig19_{TAG}_trio_boxplot_tukey.pdf` (`TAG` = `ulm_top100_unique`) |
+| G | `03_activity_inference_model/05_inference_model_validation_AMP/04_lineage_tf_disease_expression.ipynb` | `lineage_tf_pseudobulk_expression_focal.pdf` (`GATA3` panel) |
+| I | `03_activity_inference_model/05_inference_model_validation_AMP/03_sig19_ulm_unique_sets.ipynb` | `sig19_{TAG}_trio_boxplot_tukey.pdf` (`TAG` = `ulm_top100_unique`) |
 
 ### Extended Data figures
 
@@ -218,10 +219,10 @@ Each figure panel generated in this repo, the script that makes it, and the outp
 
 | Panel | Script | Output file |
 |---|---|---|
-| A | `02_combinatorial_screen_signalseq_SIG13/12_gene_level_analysis/01_interaction_deg_manuscript_viz.Rmd` | `plots/Th_diff_example_synergies_full_plots.pdf` |
-| B | `02_combinatorial_screen_signalseq_SIG13/12_gene_level_analysis/03_interaction_vis_circos.Rmd` | not saved to a file (drawn inline; see the rendered `.html`) |
+| A | `02_combinatorial_screen_signalseq_SIG13/12_gene_level_analysis/03_interaction_vis_circos.Rmd` | not saved to a file (drawn inline; see the rendered `.html`) |
+| B | `02_combinatorial_screen_signalseq_SIG13/12_gene_level_analysis/01_interaction_deg_manuscript_viz.Rmd` | `plots/Th_diff_example_synergies_full_plots.pdf` |
 | C | `02_combinatorial_screen_signalseq_SIG13/06_interaction_scoring_null/04_synergy_buffering_magnitude_test.Rmd` | `05_rate_matched_abs_additive_ecdf.pdf` |
-| D | same as A | `plots/class_frequency_boxplots.pdf` |
+| D | same as B | `plots/class_frequency_boxplots.pdf` |
 
 #### Extended Data Figure 10
 
@@ -305,3 +306,4 @@ Each figure panel generated in this repo, the script that makes it, and the outp
 | B | `03_activity_inference_model/03_inference_model_disease_bulk/09_viz_amp_2023.Rmd` | `amp_ctap_celltype_significance_grid.pdf` |
 | C | `03_activity_inference_model/05_inference_model_validation_AMP/01_activity_sc_visualization.ipynb` | `inference_model_validation_AMP/sc_viz_TF_{tag}_cells.pdf` (`tag` = `T7`; figure shows 4 of the 7 panels) |
 | D–H | `03_activity_inference_model/05_inference_model_validation_AMP/02_deg_gene_sets_sc.ipynb` | D–F: `signature_comparison_foldchange_pairs_union.pdf`<br>G: `ulm_replicates_barplot_by_condition.pdf`<br>H: `gsea_running_es_{direction}.pdf` (`up`, `dn`) |
+| I | `03_activity_inference_model/05_inference_model_validation_AMP/04_lineage_tf_disease_expression.ipynb` | `lineage_tf_pseudobulk_expression_focal.pdf` (`IKZF2`, `TBX21` panels) |

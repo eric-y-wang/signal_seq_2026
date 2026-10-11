@@ -28,7 +28,7 @@ at `padj < 0.01`) and scored with decoupler ULM.
   mapped mouse -> human, top 100 genes per cluster with genes shared between clusters
   removed. Scored with ULM on donor x subset AMP pseudobulk, centred per donor, and
   tested with Welch's t-test (T-7 vs each other subset) and Tukey HSD.
-- **`04_gata3_ikzf2_expression.ipynb`**: `GATA3`, `IKZF2` (Helios) and `TBX21` (T-bet)
+- **`04_lineage_tf_disease_expression.ipynb`**: `GATA3` and lineage TF
   expression across the 13 AMP CD4 subsets of the `T + F` CTAP (UMAP, dot plot), then
   donor x subset pseudobulk (mean `log1p_norm`, >= 10 cells) of T-7, T-3 and T-4 in RA
   `T + F` vs OA control, tested with Mann-Whitney U (BH across the three subsets per gene).
@@ -63,6 +63,6 @@ Written to `analysis_outs/03_activity_inference_model/inference_model_validation
   and figures
 - **03**: files prefixed `sig19_ulm_top100_unique_*` (gene sets, ULM and test tables,
   figures), plus a copy of the ortholog map `mouse_human_orthologs_biomart.csv`
-- **04**: files prefixed `gata3_ikzf2_*`: `_umap_expression_TF.pdf`, `_umap_subset_TF.pdf`,
+- **04**: files prefixed `lineage_tf_*`: `_umap_expression_TF.pdf`, `_umap_subset_TF.pdf`,
   `_dotplot_TF.pdf`, `_pseudobulk_focal.csv`, `_pseudobulk_expression_focal.pdf` and
   `_ra_vs_control_mannwhitney.csv`

@@ -5,7 +5,6 @@ This repository contains the analysis code, custom functions, and reproducibilit
 
 The repository is organized into three main code directories (`analysis`, `functions`, and `environments`) plus a stable data directory (`imports_stable`) for reproducing analyses.
 
-
 ### 1. Analysis
 The `analysis/` directory contains the core workflows used to generate the results and figures in the manuscript. Each module is named `NN_<description>_<experiment ID>` and has its own `README.md` describing the design, inputs, outputs and how to run it. Files and subfolders are numbered to indicate the order of execution.
 
@@ -71,15 +70,23 @@ Scripts use no absolute paths. Each one finds the repository root by searching u
 * **`imports_stable/`**: Frozen copies of the input files the scripts read (~50 GB), grouped by experiment (`SIG13/`, `SIG18/`, ...). This includes data generated in this study and the outputs of earlier pipeline steps, so most steps can be run on their own. Some files are not included and must be added separately (see [Running the repository](#running-the-repository), step 2). The folder is not tracked in git and is downloaded separately (see [Running the repository](#running-the-repository)).
 * **`analysis_outs/`**: Outputs written by the scripts, one subfolder per analysis module (not tracked in git).
 
-## Running the repository
+## System Requirements
+
+This repository has been tested on Linux operating systems. All software versions can be found in the .yaml files within `environments/`.
+
+## Installation & running the repository
 
 The code in this repository runs against the `imports_stable/` data folder, which is downloaded separately.
 
-1. **Get the data.** `imports_stable/` (~50 GB total) is distributed as a Zenodo deposit (https://doi.org/10.5281/zenodo.22997145) with some larger files contained in GEO ([GSE318270](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE318270), [GSE318270](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE318270), [GSE348675](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE348675). 
+1. **Download repository.** Install time is on the order of minutes.
+2. **Get the data.** `imports_stable/` (~50 GB total) is distributed as a Zenodo deposit (https://doi.org/10.5281/zenodo.22997145) with some larger files contained in GEO ([GSE318270](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE318270), [GSE318270](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE318270), [GSE348675](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE348675). 
 
-2. **Create the environments.** Create the conda environments in `environments/` that you need (for example, `mamba env create -f environments/scanpy_standard2.yaml`). Each module's `README.md` lists which environment each notebook or script uses.
+3. **Create the environments.** Create the conda environments in `environments/` that you need (for example, `mamba env create -f environments/scanpy_standard2.yaml`). Each module's `README.md` lists which environment each notebook or script uses.
 4. **Run from inside the repository.** Scripts use no absolute paths: each one finds the repository root by searching upward for `imports_stable/`, so open notebooks, knit R Markdown documents and submit `sbatch` jobs from inside the repository. Every script reads its inputs from `imports_stable/` and writes its outputs to `analysis_outs/<analysis module>/` (not tracked in git). Because `imports_stable/` includes the outputs of earlier pipeline steps, most notebooks and scripts can be run on their own without re-running the steps before it.
 
+## Run time
+
+Expected run time for scripts range from minutes to hours but none are longer than a few hours.
 
 ## Figure panels
 
